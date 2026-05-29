@@ -56,6 +56,9 @@ def build_model(args, only_teacher=False, img_size=224, device=None):
             untie_global_and_local_cls_norm=args.untie_global_and_local_cls_norm,
             register_attn_type=getattr(args, "register_attn_type", "standard"),
             slot_mode=getattr(args, "slot_mode", "slot"),
+            register_attn_exclude_cls=getattr(args, "register_attn_exclude_cls", True),
+            register_init=getattr(args, "register_init", "learned"),
+            register_gaussian_std_init=getattr(args, "register_gaussian_std_init", 0.02),
             device=device,
         )
         teacher = vits.__dict__[args.arch](**vit_kwargs)

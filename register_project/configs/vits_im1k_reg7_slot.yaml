@@ -40,6 +40,9 @@ student:
   n_storage_tokens: 7               # 7 register / slot tokens
   register_attn_type: slot          # <-- slot-register competition attention
   slot_mode: slot                   # "slot" (key-renormalized weighted mean) or "literal"
+  register_attn_exclude_cls: true   # registers compete over patch tokens only
+  register_init: learned            # "gaussian" samples registers from trainable mean/std
+  register_gaussian_std_init: 0.02
 
 # DINOv3 default crop resolution (256 global / 112 local).
 crops:

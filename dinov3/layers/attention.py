@@ -118,14 +118,16 @@ class SelfAttention(nn.Module):
         return x.reshape([B, N, C])
 
 
-def _split_register_keys(t: Tensor, n_storage_tokens: int) -> Tensor:
-    """Drop the register key/value columns, keeping [cls, patches].
+def _split_register_keys(t: Tensor, n_storage_tokens: int, exclude_cls: bool = False) -> Tensor:
+    """Drop the register key/value columns, keeping patches and optionally cls.
 
     Token layout along dim=-2 is [cls(1), storage/registers(R), patches(P)].
-    Returns a tensor over the non-register keys: [B, heads, 1 + P, d].
+    Returns a tensor over the non-register keys: [B, heads, P or 1 + P, d].
     """
-    cls = t[:, :, :1, :]
     patches = t[:, :, 1 + n_storage_tokens :, :]
+    if exclude_cls:
+        return patches
+    cls = t[:, :, :1, :]
     return torch.cat([cls, patches], dim=-2)
 
 
@@ -136,11 +138,12 @@ def compute_register_competition(
     n_storage_tokens: int,
     scale: float,
     renorm: bool,
+    exclude_cls: bool,
     eps: float = 1e-8,
 ) -> Tensor:
     """Slot-attention-style output for the register query rows.
 
-    Registers attend only to non-register tokens (cls + patches) and the
+    Registers attend only to non-register tokens (patches, optionally cls) and the
     attention logits are softmaxed across the *query* (register) dimension so the
     registers compete for each input token, as in Locatello et al. slot
     attention.
@@ -156,12 +159,12 @@ def compute_register_competition(
     """
     R = n_storage_tokens
     q_reg = q[:, :, 1 : 1 + R, :].float()  # [B, h, R, d]
-    k_nr = _split_register_keys(k, R).float()  # [B, h, 1+P, d]
-    v_nr = _split_register_keys(v, R)  # [B, h, 1+P, d]
+    k_nr = _split_register_keys(k, R, exclude_cls=exclude_cls).float()  # [B, h, P or 1+P, d]
+    v_nr = _split_register_keys(v, R, exclude_cls=exclude_cls)  # [B, h, P or 1+P, d]
 
-    logits = torch.matmul(q_reg, k_nr.transpose(-2, -1)) * scale  # [B, h, R, 1+P]
+    logits = torch.matmul(q_reg, k_nr.transpose(-2, -1)) * scale  # [B, h, R, P or 1+P]
     # Competition: softmax across the register (query) dimension, per key.
-    attn = torch.softmax(logits, dim=-2)  # [B, h, R, 1+P]
+    attn = torch.softmax(logits, dim=-2)  # [B, h, R, P or 1+P]
     if renorm:
         attn = attn / (attn.sum(dim=-1, keepdim=True) + eps)
     out_reg = torch.matmul(attn.to(v_nr.dtype), v_nr)  # [B, h, R, d]
@@ -178,6 +181,7 @@ def extract_register_patch_attention(
     apply_rope_fn=None,
     attn_type: str = "standard",
     slot_renorm: bool = True,
+    slot_exclude_cls: bool = True,
 ) -> Tensor:
     """Compute register->patch attention weights for visualization / MBO masks.
 
@@ -185,7 +189,8 @@ def extract_register_patch_attention(
     using the same softmax convention the model was trained with:
       * "standard": softmax over all keys, then read off the patch columns.
       * "slot": competition softmax over the register dimension (registers vs
-        cls+patches), optionally key-renormalized, then read off patch columns.
+        patches, optionally cls), optionally key-renormalized, then read off
+        patch columns.
     """
     B, N, _ = qkv.shape
     C = qkv.shape[-1] // 3
@@ -197,12 +202,12 @@ def extract_register_patch_attention(
     R = n_storage_tokens
     q_reg = q[:, :, 1 : 1 + R, :].float()
     if attn_type == "slot":
-        k_nr = _split_register_keys(k, R).float()  # [B,h,1+P,d]
-        logits = torch.matmul(q_reg, k_nr.transpose(-2, -1)) * scale  # [B,h,R,1+P]
+        k_nr = _split_register_keys(k, R, exclude_cls=slot_exclude_cls).float()  # [B,h,P or 1+P,d]
+        logits = torch.matmul(q_reg, k_nr.transpose(-2, -1)) * scale  # [B,h,R,P or 1+P]
         attn = torch.softmax(logits, dim=-2)  # competition across registers
         if slot_renorm:
             attn = attn / (attn.sum(dim=-1, keepdim=True) + 1e-8)
-        return attn[:, :, :, 1:]  # drop cls column -> [B,h,R,P]
+        return attn if slot_exclude_cls else attn[:, :, :, 1:]  # [B,h,R,P]
     else:
         logits = torch.matmul(q_reg, k.float().transpose(-2, -1)) * scale  # [B,h,R,N]
         attn = torch.softmax(logits, dim=-1)  # over all keys
@@ -216,6 +221,7 @@ class RegisterSlotAttention(SelfAttention):
     (standard softmax over all keys, including registers). Register query rows
     instead:
       * cannot attend to any register token (incl. themselves),
+      * exclude the cls token by default,
       * softmax their logits across the register/query dimension (competition).
 
     ``slot_mode`` controls aggregation after the competition softmax:
@@ -223,13 +229,21 @@ class RegisterSlotAttention(SelfAttention):
       * "literal": ``out = A @ v`` with no second normalization.
     """
 
-    def __init__(self, *args, n_storage_tokens: int = 0, slot_mode: str = "slot", **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        n_storage_tokens: int = 0,
+        slot_mode: str = "slot",
+        exclude_cls: bool = True,
+        **kwargs,
+    ) -> None:
         super().__init__(*args, **kwargs)
         assert n_storage_tokens > 0, "RegisterSlotAttention requires n_storage_tokens > 0"
         assert slot_mode in ("slot", "literal"), f"unknown slot_mode={slot_mode}"
         self.n_storage_tokens = n_storage_tokens
         self.slot_mode = slot_mode
         self.slot_renorm = slot_mode == "slot"
+        self.exclude_cls = exclude_cls
 
     def compute_attention(self, qkv: Tensor, attn_bias=None, rope=None) -> Tensor:
         assert attn_bias is None
@@ -243,7 +257,7 @@ class RegisterSlotAttention(SelfAttention):
         # Standard attention for all rows (fast path); register rows are overwritten.
         x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         out_reg = compute_register_competition(
-            q, k, v, self.n_storage_tokens, self.scale, self.slot_renorm
+            q, k, v, self.n_storage_tokens, self.scale, self.slot_renorm, self.exclude_cls
         )
         x = x.clone()
         x[:, :, 1 : 1 + self.n_storage_tokens, :] = out_reg

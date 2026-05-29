@@ -109,20 +109,25 @@ Outputs (checkpoints, logs, `config.yaml`) land in `runs/<name>/`.
 
 **Slot-register attention** — `dinov3/layers/attention.py`
 - `RegisterSlotAttention`: registers never attend to any register; their
-  logits over (cls+patches) are softmaxed across the **register/query**
-  dimension (competition). `slot_mode="slot"` adds slot-attention key
-  renormalization (weighted mean); `slot_mode="literal"` uses `out = A @ V`.
-  All non-register tokens are unchanged and may attend to registers.
+  logits over patches (or cls+patches with `register_attn_exclude_cls=false`)
+  are softmaxed across the **register/query** dimension (competition).
+  `slot_mode="slot"` adds slot-attention key renormalization (weighted mean);
+  `slot_mode="literal"` uses `out = A @ V`. All non-register tokens are
+  unchanged and may attend to registers.
   Implemented as fast SDPA for the bulk + explicit competition for register rows.
 - `extract_register_patch_attention(...)`: register→patch weights for viz/MBO,
   consistent with the model's attention type.
 
 **Model wiring** — `dinov3/models/vision_transformer.py`, `dinov3/models/__init__.py`
-- `register_attn_type` (`standard`|`slot`) and `slot_mode` flow from config.
+- `register_attn_type` (`standard`|`slot`), `slot_mode`,
+  `register_attn_exclude_cls`, and `register_init` flow from config.
+- `register_init="gaussian"` samples per-image register tokens from trainable
+  per-register mean/log-std parameters.
 - `DinoVisionTransformer.get_register_patch_attention(x, layer)` → `[B, R, H, W]`.
 
 **Config** — `dinov3/configs/ssl_default_config.yaml`
-- `student.register_attn_type`, `student.slot_mode`
+- `student.register_attn_type`, `student.slot_mode`,
+  `student.register_attn_exclude_cls`, `student.register_init`
 - `train.wandb.*`, `schedule.*` (step-based), `register_viz.*`, `mbo.*`
 
 **Step-based scheduling** — `dinov3/train/step_schedule.py`

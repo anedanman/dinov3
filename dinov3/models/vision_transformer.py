@@ -4,6 +4,7 @@
 # the terms of the DINOv3 License Agreement.
 
 import logging
+import math
 from functools import partial
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
@@ -99,6 +100,9 @@ class DinoVisionTransformer(nn.Module):
         untie_global_and_local_cls_norm: bool = False,
         register_attn_type: str = "standard",
         slot_mode: str = "slot",
+        register_attn_exclude_cls: bool = True,
+        register_init: str = "learned",
+        register_gaussian_std_init: float = 0.02,
         device: Any | None = None,
         **ignored_kwargs,
     ):
@@ -124,8 +128,16 @@ class DinoVisionTransformer(nn.Module):
 
         self.cls_token = nn.Parameter(torch.empty(1, 1, embed_dim, device=device))
         self.n_storage_tokens = n_storage_tokens
+        assert register_init in ("learned", "gaussian"), f"unknown register_init={register_init}"
+        assert register_gaussian_std_init > 0, "register_gaussian_std_init must be positive"
+        self.register_init = register_init
+        self.register_gaussian_std_init = register_gaussian_std_init
         if self.n_storage_tokens > 0:
             self.storage_tokens = nn.Parameter(torch.empty(1, n_storage_tokens, embed_dim, device=device))
+            if self.register_init == "gaussian":
+                self.storage_tokens_log_sigma = nn.Parameter(
+                    torch.empty(1, n_storage_tokens, embed_dim, device=device)
+                )
         logger.info(f"using base={pos_embed_rope_base} for rope new")
         logger.info(f"using min_period={pos_embed_rope_min_period} for rope new")
         logger.info(f"using max_period={pos_embed_rope_max_period} for rope new")
@@ -155,10 +167,19 @@ class DinoVisionTransformer(nn.Module):
         assert register_attn_type in ("standard", "slot"), f"unknown register_attn_type={register_attn_type}"
         self.register_attn_type = register_attn_type
         self.slot_mode = slot_mode
+        self.register_attn_exclude_cls = register_attn_exclude_cls
         if register_attn_type == "slot":
             assert n_storage_tokens > 0, "register_attn_type='slot' requires n_storage_tokens > 0"
-            logger.info(f"using SLOT register attention (mode={slot_mode}) with {n_storage_tokens} registers")
-            attn_class = partial(RegisterSlotAttention, n_storage_tokens=n_storage_tokens, slot_mode=slot_mode)
+            logger.info(
+                "using SLOT register attention "
+                f"(mode={slot_mode}, exclude_cls={register_attn_exclude_cls}) with {n_storage_tokens} registers"
+            )
+            attn_class = partial(
+                RegisterSlotAttention,
+                n_storage_tokens=n_storage_tokens,
+                slot_mode=slot_mode,
+                exclude_cls=register_attn_exclude_cls,
+            )
         else:
             attn_class = SelfAttention
 
@@ -210,6 +231,8 @@ class DinoVisionTransformer(nn.Module):
         nn.init.normal_(self.cls_token, std=0.02)
         if self.n_storage_tokens > 0:
             nn.init.normal_(self.storage_tokens, std=0.02)
+            if self.register_init == "gaussian":
+                nn.init.constant_(self.storage_tokens_log_sigma, math.log(self.register_gaussian_std_init))
         nn.init.zeros_(self.mask_token)
         named_apply(init_weights_vit, self)
 
@@ -224,10 +247,16 @@ class DinoVisionTransformer(nn.Module):
         else:
             cls_token = self.cls_token + 0 * self.mask_token
         if self.n_storage_tokens > 0:
-            storage_tokens = self.storage_tokens
+            if self.register_init == "gaussian":
+                mu = self.storage_tokens.expand(B, -1, -1)
+                sigma = self.storage_tokens_log_sigma.exp().expand(B, -1, -1)
+                eps = torch.randn(mu.shape, dtype=mu.dtype, device=mu.device)
+                storage_tokens = mu + eps * sigma
+            else:
+                storage_tokens = self.storage_tokens.expand(B, -1, -1)
         else:
             storage_tokens = torch.empty(
-                1,
+                B,
                 0,
                 cls_token.shape[-1],
                 dtype=cls_token.dtype,
@@ -237,7 +266,7 @@ class DinoVisionTransformer(nn.Module):
         x = torch.cat(
             [
                 cls_token.expand(B, -1, -1),
-                storage_tokens.expand(B, -1, -1),
+                storage_tokens,
                 x,
             ],
             dim=1,
@@ -374,6 +403,7 @@ class DinoVisionTransformer(nn.Module):
                     apply_rope_fn=blk.attn.apply_rope,
                     attn_type=self.register_attn_type,
                     slot_renorm=(self.slot_mode == "slot"),
+                    slot_exclude_cls=self.register_attn_exclude_cls,
                 )  # [B, heads, R, P]
                 attn = attn.mean(dim=1)  # [B, R, P]
                 return attn.reshape(attn.shape[0], self.n_storage_tokens, H, W)
