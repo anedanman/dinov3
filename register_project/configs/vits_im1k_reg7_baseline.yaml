@@ -17,7 +17,9 @@ train:
   grad_accum_steps: 4
   dataset_path: ImageNetPacked:split=TRAIN:root=~/datasets/imagenet1k_packed
   num_workers: 8
-  compile: true
+  # compile=true leaks host RAM (~0.3 GB/min via Inductor) and OOMs a 31GB box in ~50 min.
+  # Keep false here; re-enable only on a high-RAM machine.
+  compile: false
   OFFICIAL_EPOCH_LENGTH: 1          # overwritten by the step-based schedule normalizer
   wandb:
     enabled: true

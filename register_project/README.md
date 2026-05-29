@@ -168,3 +168,8 @@ Outputs (checkpoints, logs, `config.yaml`) land in `runs/<name>/`.
   adjust either factor (e.g. `batch_size_per_gpu=256 grad_accum_steps=2` for fewer,
   larger steps if you have GPU headroom). LR scaling uses the *effective* batch.
 - Dataset roots in configs may use `~` (expanded automatically).
+- **`train.compile` and host RAM**: `torch.compile=true` grows host RAM (~0.3 GB/min
+  via Inductor) and OOMs a 31 GB box in ~50 min (the OOM killer sends SIGTERM →
+  `torchrun` reports `Process ... got signal: 15`). The configs ship `compile:
+  false`, which is stable (~16 GB flat). Re-enable compile only on a high-RAM
+  machine. To diagnose an OOM kill: `journalctl -k --since "10 min ago" | grep -i oom`.
