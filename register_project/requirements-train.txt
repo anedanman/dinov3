@@ -4,6 +4,7 @@ numpy
 pillow
 omegaconf
 wandb
+huggingface_hub
 pyarrow
 pycocotools
 matplotlib

@@ -27,6 +27,7 @@ encoded bytes), so it plugs into the existing decode/transform pipeline.
 
 import logging
 import os
+import re
 from enum import Enum
 from typing import Callable, Optional, Tuple, Union
 
@@ -141,6 +142,31 @@ class ImageNetPacked(ExtendedVisionDataset):
         return len(self._index)
 
 
+def _check_complete_hf_shards(shards: list[str], split: "ImageNetPacked.Split") -> None:
+    """Fail early when a HuggingFace shard download is incomplete."""
+    parsed = []
+    for shard in shards:
+        match = re.search(r"-(\d+)-of-(\d+)\.parquet$", os.path.basename(shard))
+        if match is not None:
+            parsed.append((int(match.group(1)), int(match.group(2))))
+    if not parsed:
+        return
+
+    totals = {total for _, total in parsed}
+    if len(totals) != 1:
+        raise FileNotFoundError(f"Inconsistent parquet shard totals for split={split.value}: {sorted(totals)}")
+    total = totals.pop()
+    seen = {idx for idx, _ in parsed}
+    missing = sorted(set(range(total)) - seen)
+    if len(seen) != total or missing:
+        preview = ", ".join(str(i) for i in missing[:10])
+        suffix = "..." if len(missing) > 10 else ""
+        raise FileNotFoundError(
+            f"Incomplete ImageNet parquet for split={split.value}: found {len(seen)}/{total} shards in "
+            f"{os.path.dirname(shards[0])}. Missing shard indices: {preview}{suffix}"
+        )
+
+
 def build_packed_imagenet(
     parquet_dir: str,
     out_dir: str,
@@ -163,6 +189,7 @@ def build_packed_imagenet(
     shards = sorted(glob.glob(os.path.join(parquet_dir, split.parquet_glob)))
     if not shards:
         raise FileNotFoundError(f"No parquet shards matching {split.parquet_glob} in {parquet_dir}")
+    _check_complete_hf_shards(shards, split)
 
     blob_path = os.path.join(out_dir, f"{split.value}.bin")
     index_path = os.path.join(out_dir, f"{split.value}_index.npy")

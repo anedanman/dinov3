@@ -10,6 +10,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 bash "$HERE/setup_env.sh"
 bash "$HERE/prepare_data.sh"
+bash "$HERE/validate_setup.sh"
 
 echo
 echo "[all done] To train:"

@@ -27,9 +27,19 @@ def _download(url: str, dest: str):
         print(f"[skip] {dest} already exists")
         return
 
+    last_pct = -1
+    last_mb = -50
+
     def hook(blocks, bs, total):
+        nonlocal last_mb, last_pct
         done = blocks * bs
         pct = (100 * done / total) if total > 0 else 0
+        mb = int(done / 1e6)
+        pct_int = int(pct)
+        if total > 0 and done < total and pct_int == last_pct and mb < last_mb + 50:
+            return
+        last_pct = pct_int
+        last_mb = mb
         sys.stdout.write(f"\r  {os.path.basename(dest)}: {done / 1e6:.0f} MB ({pct:.1f}%)")
         sys.stdout.flush()
 
