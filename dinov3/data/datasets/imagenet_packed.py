@@ -9,7 +9,9 @@ The HuggingFace ``ILSVRC/imagenet-1k`` release stores images as ~100 MB parquet
 row groups, which makes per-sample random access (as required by the SSL
 ``InfiniteSampler``) very expensive. To get cheap O(1) random access we repack
 the encoded JPEG bytes once into a single flat blob per split plus a small
-structured index, both of which are memory-mapped at training time.
+structured index. The index is loaded eagerly; the blob is read on demand with
+positional reads (``os.pread``) so workers never map the whole multi-hundred-GB
+file (which would leave touched pages resident and creep host RAM upward).
 
 Layout produced by :func:`build_packed_imagenet` under ``root``::
 
@@ -89,24 +91,45 @@ class ImageNetPacked(ExtendedVisionDataset):
                 f"Build it with tools/build_packed_imagenet.py "
                 f"(expected {self._blob_path} and {self._index_path})."
             )
-        # Index is small; load eagerly. Blob is mmap'd lazily per worker.
+        # Index is small; load eagerly. The blob is read with positional reads
+        # (os.pread) rather than mmap'd: mapping the whole multi-hundred-GB blob
+        # leaves every touched page resident per worker, so host RAM creeps up
+        # over a run. pread copies exactly the requested bytes and nothing lingers.
         self._index = np.load(self._index_path)
-        self._blob = None  # np.memmap, opened lazily so it survives DataLoader forking
+        self._fd = None  # opened lazily so the descriptor is created per DataLoader worker
 
     @property
     def split(self) -> "ImageNetPacked.Split":
         return self._split
 
-    def _get_blob(self) -> np.memmap:
-        if self._blob is None:
-            self._blob = np.memmap(self._blob_path, dtype=np.uint8, mode="r")
-        return self._blob
+    def _get_fd(self) -> int:
+        if self._fd is None:
+            self._fd = os.open(self._blob_path, os.O_RDONLY)
+        return self._fd
 
     def get_image_data(self, index: int) -> bytes:
         entry = self._index[index]
-        start = int(entry["offset"])
-        end = start + int(entry["length"])
-        return self._get_blob()[start:end].tobytes()
+        offset = int(entry["offset"])
+        length = int(entry["length"])
+        fd = self._get_fd()
+        # os.pread does not use or mutate the fd offset, so it is safe even if the
+        # descriptor is shared across forked workers. Regular-file reads return the
+        # full count except on rare short reads; top up if that happens.
+        data = os.pread(fd, length, offset)
+        while len(data) < length:
+            more = os.pread(fd, length - len(data), offset + len(data))
+            if not more:
+                break
+            data += more
+        return data
+
+    def __del__(self):
+        fd = getattr(self, "_fd", None)
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     def get_target(self, index: int) -> Optional[Target]:
         return int(self._index[index]["label"])

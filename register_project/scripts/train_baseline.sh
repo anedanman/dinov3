@@ -9,6 +9,14 @@ OUTPUT_DIR="${OUTPUT_DIR:-$REPO/runs/vits_reg7_baseline}"
 NGPUS="${NGPUS:-1}"
 
 export PYTHONPATH="$REPO:${PYTHONPATH:-}"
+
+# Tame glibc host-RAM creep in the DataLoader workers (inherited by all forks).
+# Variable-size JPEG decode/augmentation fragments per-thread malloc arenas that
+# are never returned to the OS; on a low-RAM box this OOMs after hours even though
+# GPU memory stays flat and gc.collect() (disabled in train.py) can't reclaim it.
+export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"        # fewer arenas -> less fragmentation
+export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-0}"  # return freed memory to the OS
+
 mkdir -p "$OUTPUT_DIR"
 
 cd "$REPO"
