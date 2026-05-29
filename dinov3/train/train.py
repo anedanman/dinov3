@@ -36,9 +36,12 @@ from dinov3.data import (
     CombinedDataLoader,
 )
 from dinov3.logging import MetricLogger, setup_logging
+from dinov3.logging import wandb_logger
 from dinov3.train.cosine_lr_scheduler import CosineScheduler, linear_warmup_cosine_decay
 from dinov3.train.multidist_meta_arch import MultiDistillationMetaArch
 from dinov3.train.ssl_meta_arch import SSLMetaArch
+from dinov3.train.step_schedule import normalize_step_schedule
+from dinov3.eval.register_tokens.evaluator import RegisterEvaluator
 
 assert torch.__version__ >= (2, 1)
 torch.backends.cuda.matmul.allow_tf32 = True  # pytorch 1.12 sets this to false by default
@@ -157,18 +160,20 @@ def build_schedulers_v2(cfg):
     total_iterations = cfg.train.OFFICIAL_EPOCH_LENGTH * cfg.optim.epochs
     logger.info(f"Total training iterations {total_iterations}")
 
-    # LR scaling rules
+    # LR scaling rules (use the EFFECTIVE batch size, including gradient accumulation)
+    grad_accum = max(1, int(cfg.train.get("grad_accum_steps", 1)))
+    effective_batch = cfg.train.batch_size_per_gpu * distributed.get_world_size() * grad_accum
     lr_peak = cfg.schedules.lr.peak
     lr_end = cfg.schedules.lr.end
     if cfg.optim.scaling_rule == "linear_wrt_256":
-        lr_peak *= cfg.train.batch_size_per_gpu * distributed.get_world_size() / 256.0
-        lr_end *= cfg.train.batch_size_per_gpu * distributed.get_world_size() / 256.0
+        lr_peak *= effective_batch / 256.0
+        lr_end *= effective_batch / 256.0
         logger.info(
             f"Scaling rule {cfg.optim.scaling_rule}, LR peak {cfg.schedules.lr.peak} -> {lr_peak}, LR end {cfg.schedules.lr.end} -> {lr_end}"
         )
     elif cfg.optim.scaling_rule == "sqrt_wrt_1024":
-        lr_peak *= 4 * math.sqrt(cfg.train.batch_size_per_gpu * distributed.get_world_size() / 1024.0)
-        lr_end *= 4 * math.sqrt(cfg.train.batch_size_per_gpu * distributed.get_world_size() / 1024.0)
+        lr_peak *= 4 * math.sqrt(effective_batch / 1024.0)
+        lr_end *= 4 * math.sqrt(effective_batch / 1024.0)
         logger.info(
             f"Scaling rule {cfg.optim.scaling_rule}, LR peak {cfg.schedules.lr.peak} -> {lr_peak}, LR end {cfg.schedules.lr.end} -> {lr_end}"
         )
@@ -317,6 +322,7 @@ def build_data_loader_from_cfg(
     else:
         sampler_type = SamplerType.SHARDED_INFINITE if cfg.train.cache_dataset else SamplerType.INFINITE
 
+    grad_accum = max(1, int(cfg.train.get("grad_accum_steps", 1)))
     data_loader = make_data_loader(
         dataset=dataset,
         batch_size=batch_size,
@@ -324,7 +330,8 @@ def build_data_loader_from_cfg(
         shuffle=True,
         seed=cfg.train.seed + start_iter + 1,
         sampler_type=sampler_type,
-        sampler_advance=start_iter * dataloader_batch_size_per_gpu,
+        # Each optimizer step consumes `grad_accum` micro-batches.
+        sampler_advance=start_iter * dataloader_batch_size_per_gpu * grad_accum,
         drop_last=True,
         collate_fn=collate_fn,
     )
@@ -415,10 +422,31 @@ def do_train(cfg, model, resume=False):
         )
     OFFICIAL_EPOCH_LENGTH = cfg.train.OFFICIAL_EPOCH_LENGTH
     max_iter = cfg.optim.epochs * OFFICIAL_EPOCH_LENGTH
+    grad_accum = max(1, int(cfg.train.get("grad_accum_steps", 1)))
     if cfg.multidistillation.enabled:
         global_batch_size = cfg.multidistillation.global_batch_size
     else:
-        global_batch_size = cfg.train.batch_size_per_gpu * distributed.get_world_size()
+        global_batch_size = cfg.train.batch_size_per_gpu * distributed.get_world_size() * grad_accum
+    if grad_accum > 1:
+        logger.info(
+            f"Gradient accumulation: {grad_accum} micro-batches/step "
+            f"-> effective batch {global_batch_size} (micro {cfg.train.batch_size_per_gpu} x world "
+            f"{distributed.get_world_size()} x accum {grad_accum})"
+        )
+
+    def _grouped(loader, k):
+        """Yield lists of `k` consecutive micro-batches (one optimizer step)."""
+        it = iter(loader)
+        while True:
+            group = []
+            try:
+                for _ in range(k):
+                    group.append(next(it))
+            except StopIteration:
+                if group:
+                    yield group
+                return
+            yield group
 
     # Build data loader
     data_loader = build_multi_resolution_data_loader_from_cfg(
@@ -431,6 +459,11 @@ def do_train(cfg, model, resume=False):
     logger.info("Starting training from iteration %d", start_iter)
     metrics_file = os.path.join(cfg.train.output_dir, "training_metrics.json")
     metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file)
+
+    # Weights & Biases + register-token evaluator (viz + COCO MBO)
+    wandb_run = wandb_logger.init_wandb(cfg)
+    wandb_log_freq = cfg.train.get("wandb", {}).get("log_freq", 10) if cfg.train.get("wandb", None) else 10
+    register_evaluator = RegisterEvaluator(cfg)
     # Manual garbage collection
     gc.disable()
     gc.collect()
@@ -451,15 +484,14 @@ def do_train(cfg, model, resume=False):
         num_gram_updates = math.ceil((start_iter + 1 - cfg.gram.it_first_update) / cfg.gram.update_frequency)
         logger.info(f"Gram was updated {num_gram_updates} times before iteration {start_iter}")
     consecutive_nan_count = 0
-    for data in metric_logger.log_every(
-        data_loader,
+    for data_group in metric_logger.log_every(
+        _grouped(data_loader, grad_accum),
         print_freq=10,
         header="Training",
         n_iterations=max_iter,
         start_iteration=start_iter,
     ):
         it = iteration
-        data["global_batch_size"] = global_batch_size
         if iteration > max_iter:
             return
 
@@ -480,9 +512,26 @@ def do_train(cfg, model, resume=False):
         last_layer_lr = last_layer_lr_schedule[it]
         apply_optim_scheduler(optimizer, lr, wd, last_layer_lr)
 
-        # Forward backward
+        # Forward backward over `grad_accum` micro-batches, accumulating gradients.
         optimizer.zero_grad(set_to_none=True)
-        total_loss, metrics_dict = model.forward_backward(data, teacher_temp=teacher_temp, iteration=it)
+        total_loss = None
+        accum_metrics = {}
+        loss_scale = 1.0 / grad_accum
+        for micro in data_group:
+            micro["global_batch_size"] = global_batch_size
+            micro_loss, micro_metrics = model.forward_backward(
+                micro, teacher_temp=teacher_temp, iteration=it, loss_scale=loss_scale
+            )
+            micro_loss = micro_loss.detach()
+            total_loss = micro_loss if total_loss is None else total_loss + micro_loss
+            for k, v in micro_metrics.items():
+                vt = v.detach() if torch.is_tensor(v) else torch.as_tensor(
+                    v, dtype=torch.float32, device=micro_loss.device
+                )
+                accum_metrics[k] = vt if k not in accum_metrics else accum_metrics[k] + vt
+        # Average reported loss / metrics over the accumulated micro-batches.
+        total_loss = total_loss / len(data_group)
+        metrics_dict = {k: v / len(data_group) for k, v in accum_metrics.items()}
 
         # Gradient clipping
         if cfg.optim.clip_grad:
@@ -550,6 +599,38 @@ def do_train(cfg, model, resume=False):
         metric_logger.update(last_layer_lr=last_layer_lr)
         metric_logger.update(total_loss=total_loss, **metrics_dict)
 
+        # Weights & Biases scalar logging
+        if wandb_run is not None and iteration % wandb_log_freq == 0:
+            scalars = {"train/lr": lr, "train/wd": wd, "train/mom": mom, "train/last_layer_lr": last_layer_lr}
+            scalars["train/total_loss"] = total_loss.item() if torch.is_tensor(total_loss) else total_loss
+            for k, v in metrics_dict.items():
+                scalars[f"train/{k}"] = v.item() if torch.is_tensor(v) else v
+            wandb_logger.log_scalars(wandb_run, scalars, step=iteration)
+
+        # Register-token evaluation: attention visualization + COCO MBO
+        run_viz = register_evaluator.should_run_viz(iteration)
+        run_mbo = register_evaluator.should_run_mbo(iteration)
+        if run_viz or run_mbo:
+            torch.cuda.synchronize()
+            register_evaluator.sync(model)  # collective (full_tensor); all ranks must call
+            if distributed.is_main_process():
+                if run_viz:
+                    try:
+                        panels = register_evaluator.run_viz()
+                        wandb_logger.log_images(wandb_run, panels, step=iteration, key="register_attention")
+                    except Exception as e:
+                        logger.warning(f"register viz failed: {e}")
+                if run_mbo:
+                    try:
+                        mbo_metrics = register_evaluator.run_mbo()
+                        wandb_logger.log_scalars(
+                            wandb_run, {f"mbo/{k}": v for k, v in mbo_metrics.items()}, step=iteration
+                        )
+                    except Exception as e:
+                        logger.warning(f"MBO eval failed: {e}")
+            model.train()
+            torch.cuda.synchronize()
+
         # Submit evaluation jobs
         if (
             cfg.evaluation.eval_period_iterations > 0 and (iteration + 1) % cfg.evaluation.eval_period_iterations == 0
@@ -577,6 +658,7 @@ def do_train(cfg, model, resume=False):
         iteration = iteration + 1
     metric_logger.synchronize_between_processes()
 
+    wandb_logger.finish(wandb_run)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
@@ -595,6 +677,7 @@ def main(argv=None):
     else:
         setup_job(output_dir=args.output_dir, seed=args.seed)
         cfg = setup_config(args, strict_cfg=False)
+        cfg = normalize_step_schedule(cfg)
         logger.info(cfg)
         setup_logging(
             output=os.path.join(os.path.abspath(args.output_dir), "nan_logs"),

@@ -353,7 +353,7 @@ class SSLMetaArch(nn.Module):
             logger.info(f"Performing distillation from: {self.teacher}")
 
     def forward_backward(
-        self, data, *, teacher_temp, iteration=0, **ignored_kwargs
+        self, data, *, teacher_temp, iteration=0, loss_scale: float = 1.0, **ignored_kwargs
     ) -> tuple[Tensor, dict[str, float | Tensor]]:
         del ignored_kwargs
         metrics_dict = {}
@@ -423,7 +423,9 @@ class SSLMetaArch(nn.Module):
             iteration=iteration,
         )
 
-        self.backprop_loss(loss_accumulator)
+        # Scale the loss for gradient accumulation (grads from `1/loss_scale`
+        # micro-batches sum to the full-batch average). Reported loss stays unscaled.
+        self.backprop_loss(loss_accumulator if loss_scale == 1.0 else loss_accumulator * loss_scale)
 
         # Return total weighted loss and a dict of metrics to log
         return loss_accumulator, metrics_dict | loss_dict

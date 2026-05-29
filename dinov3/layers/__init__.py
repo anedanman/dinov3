@@ -3,7 +3,13 @@
 # This software may be used and distributed in accordance with
 # the terms of the DINOv3 License Agreement.
 
-from .attention import CausalSelfAttention, LinearKMaskedBias, SelfAttention
+from .attention import (
+    CausalSelfAttention,
+    LinearKMaskedBias,
+    RegisterSlotAttention,
+    SelfAttention,
+    extract_register_patch_attention,
+)
 from .block import CausalSelfAttentionBlock, SelfAttentionBlock
 from .ffn_layers import Mlp, SwiGLUFFN
 from .fp8_linear import convert_linears_to_fp8

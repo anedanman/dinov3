@@ -11,7 +11,18 @@ import torch
 import torch.nn.init
 from torch import Tensor, nn
 
-from dinov3.layers import LayerScale, Mlp, PatchEmbed, RMSNorm, RopePositionEmbedding, SelfAttentionBlock, SwiGLUFFN
+from dinov3.layers import (
+    LayerScale,
+    Mlp,
+    PatchEmbed,
+    RegisterSlotAttention,
+    RMSNorm,
+    RopePositionEmbedding,
+    SelfAttention,
+    SelfAttentionBlock,
+    SwiGLUFFN,
+)
+from dinov3.layers.attention import extract_register_patch_attention
 from dinov3.utils import named_apply
 
 logger = logging.getLogger("dinov3")
@@ -86,6 +97,8 @@ class DinoVisionTransformer(nn.Module):
         mask_k_bias: bool = False,
         untie_cls_and_patch_norms: bool = False,
         untie_global_and_local_cls_norm: bool = False,
+        register_attn_type: str = "standard",
+        slot_mode: str = "slot",
         device: Any | None = None,
         **ignored_kwargs,
     ):
@@ -137,6 +150,18 @@ class DinoVisionTransformer(nn.Module):
         logger.info(f"using {ffn_layer} layer as FFN")
         ffn_layer_cls = ffn_layer_dict[ffn_layer]
         ffn_ratio_sequence = [ffn_ratio] * depth
+
+        # Register-token attention behaviour.
+        assert register_attn_type in ("standard", "slot"), f"unknown register_attn_type={register_attn_type}"
+        self.register_attn_type = register_attn_type
+        self.slot_mode = slot_mode
+        if register_attn_type == "slot":
+            assert n_storage_tokens > 0, "register_attn_type='slot' requires n_storage_tokens > 0"
+            logger.info(f"using SLOT register attention (mode={slot_mode}) with {n_storage_tokens} registers")
+            attn_class = partial(RegisterSlotAttention, n_storage_tokens=n_storage_tokens, slot_mode=slot_mode)
+        else:
+            attn_class = SelfAttention
+
         blocks_list = [
             SelfAttentionBlock(
                 dim=embed_dim,
@@ -150,6 +175,7 @@ class DinoVisionTransformer(nn.Module):
                 act_layer=nn.GELU,
                 ffn_layer=ffn_layer_cls,
                 init_values=layerscale_init,
+                attn_class=attn_class,
                 mask_k_bias=mask_k_bias,
                 device=device,
             )
@@ -320,6 +346,39 @@ class DinoVisionTransformer(nn.Module):
             return tuple(zip(outputs, extra_tokens))
         elif return_class_token and return_extra_tokens:
             return tuple(zip(outputs, class_tokens, extra_tokens))
+
+    @torch.no_grad()
+    def get_register_patch_attention(self, x: Tensor, layer: int = -1) -> Tensor:
+        """Register-token -> patch attention maps for visualization / MBO masks.
+
+        Runs the backbone and, at the requested block (``layer``, default last),
+        returns the attention each register token places on the patch grid,
+        averaged over heads, reshaped to the spatial grid.
+
+        Returns: [B, R, H, W] attention maps (R = n_storage_tokens).
+        """
+        assert self.n_storage_tokens > 0, "no register tokens to visualize"
+        x, (H, W) = self.prepare_tokens_with_masks(x)
+        target = layer % self.n_blocks
+        for i, blk in enumerate(self.blocks):
+            rope = self.rope_embed(H=H, W=W) if self.rope_embed is not None else None
+            if i == target:
+                normed = blk.norm1(x)
+                qkv = blk.attn.qkv(normed)
+                attn = extract_register_patch_attention(
+                    qkv,
+                    num_heads=self.num_heads,
+                    n_storage_tokens=self.n_storage_tokens,
+                    scale=blk.attn.scale,
+                    rope=rope,
+                    apply_rope_fn=blk.attn.apply_rope,
+                    attn_type=self.register_attn_type,
+                    slot_renorm=(self.slot_mode == "slot"),
+                )  # [B, heads, R, P]
+                attn = attn.mean(dim=1)  # [B, R, P]
+                return attn.reshape(attn.shape[0], self.n_storage_tokens, H, W)
+            x = blk(x, rope)
+        raise RuntimeError("target block not reached")
 
     def forward(self, *args, is_training: bool = False, **kwargs) -> List[Dict[str, Tensor]] | Tensor:
         ret = self.forward_features(*args, **kwargs)

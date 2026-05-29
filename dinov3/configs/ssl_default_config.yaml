@@ -63,6 +63,7 @@ gram:
   loss_weight_schedule: null  # (dict): If not None, use a schedule for the loss weight instead of `loss_weight`
 train:
   batch_size_per_gpu: 64
+  grad_accum_steps: 1  # number of micro-batches accumulated per optimizer step; effective batch = batch_size_per_gpu * world_size * grad_accum_steps
   dataset_path: ImageNet:split=TRAIN
   data_config: null
   output_dir: .
@@ -81,6 +82,15 @@ train:
   cudagraphs: false
   sharded_eval_checkpoint: false
   cache_dataset: false
+  wandb:
+    enabled: false
+    project: dinov3-registers
+    entity: null
+    name: null  # run name; defaults to output_dir basename
+    group: null
+    tags: []
+    mode: online  # online | offline | disabled
+    log_freq: 10  # log scalar metrics every N steps
 student:
   arch: vit_large
   patch_size: 16
@@ -95,6 +105,8 @@ student:
   ffn_bias: true
   norm_layer: "layernorm"
   n_storage_tokens: 0
+  register_attn_type: standard  # "standard" or "slot" (slot-register competition attention)
+  slot_mode: slot  # "slot" (key-renormalized weighted mean) or "literal" (out = A @ v); only used when register_attn_type=slot
   mask_k_bias: false
   untie_cls_and_patch_norms: false  # If true, use separate norms for CLS/reg and patch/mask tokens
   untie_global_and_local_cls_norm: false  # If true, use separate norms for local and global crop CLS token during training
@@ -145,6 +157,15 @@ optim:
   dump_fsdp_weights_path: ""
   adamw_beta1: 0.9
   adamw_beta2: 0.999
+# Step-based scheduling. When `enabled`, training length and all warmups are
+# expressed directly in optimizer steps (not epochs). This is mapped onto the
+# epoch-based machinery by setting train.OFFICIAL_EPOCH_LENGTH = 1.
+schedule:
+  enabled: false
+  total_steps: 100000
+  warmup_steps: 5000
+  freeze_last_layer_steps: 1250
+  teacher_temp_warmup_steps: 18750
 crops:
   global_crops_scale:
   - 0.32
@@ -180,6 +201,29 @@ checkpointing:
   period: 3750
   max_to_keep: 3
   keep_every: 99999999999999999  # Save a checkpoint every N iterations, regardless of max_to_keep and period
+
+# ---------------------------------------------------------------------------
+# Register-token research extensions (used by dinov3/eval/register_tokens)
+# ---------------------------------------------------------------------------
+register_viz:
+  enabled: false
+  every_n_steps: 2500       # render register-attention overlays every N steps
+  num_images: 8             # number of validation images to visualize
+  layer: -1                 # which block's register attention to read (-1 = last)
+  dataset: ImageNetPacked:split=VAL:root=~/datasets/imagenet1k_packed  # source of viz images
+  image_size: 224
+
+mbo:
+  enabled: false
+  every_n_steps: 5000       # compute COCO MBO every N steps
+  coco_root: ~/datasets/coco
+  split: val2017
+  max_images: 2000          # cap for speed; null = all val images
+  image_size: 224
+  layer: -1
+  upsample: bilinear        # how to upsample register attention to image resolution
+  semantic: true            # compute semantic MBO (panoptic stuff+things merged by category)
+  instance: true            # compute instance MBO (per-object masks)
 
 # Example of constant schedules with schedules v2
 # # schedules:

@@ -1,0 +1,19 @@
+# Non-torch dependencies for register-tokens training/eval.
+# torch + torchvision are installed separately (CUDA-specific) by setup_env.sh.
+numpy
+pillow
+omegaconf
+wandb
+pyarrow
+pycocotools
+matplotlib
+scipy
+scikit-learn
+termcolor
+submitit
+iopath
+pandas
+torchmetrics
+fvcore
+ftfy
+regex

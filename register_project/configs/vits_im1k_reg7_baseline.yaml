@@ -1,0 +1,78 @@
+# ===========================================================================
+# DINOv3 ViT-S/16 pretraining on ImageNet-1k
+#   * 7 register (storage) tokens
+#   * STANDARD register attention (baseline)
+#   * batch size 512 (single GPU), step-based schedule
+#   * wandb logging + register-attention viz + COCO MBO eval
+#
+# Merged on top of dinov3/configs/ssl_default_config.yaml.
+# Launch:  register_project/scripts/train_baseline.sh
+# ===========================================================================
+MODEL:
+  META_ARCHITECTURE: SSLMetaArch
+
+train:
+  # Effective batch 512 = 128 micro-batch x 4 grad-accum steps (single 95GB GPU, 31GB host RAM).
+  batch_size_per_gpu: 128
+  grad_accum_steps: 4
+  dataset_path: ImageNetPacked:split=TRAIN:root=~/datasets/imagenet1k_packed
+  num_workers: 8
+  compile: true
+  OFFICIAL_EPOCH_LENGTH: 1          # overwritten by the step-based schedule normalizer
+  wandb:
+    enabled: true
+    project: dinov3-registers
+    name: vits-reg7-baseline
+    tags: [vits, reg7, baseline, standard-attn]
+    log_freq: 10
+
+student:
+  arch: vit_small                   # ~21M params (S, 20-30M range)
+  patch_size: 16
+  drop_path_rate: 0.1
+  layerscale: 1.0e-05
+  n_storage_tokens: 7               # 7 register tokens
+  register_attn_type: standard      # baseline self-attention for registers
+
+# DINOv3 default crop resolution (256 global / 112 local).
+crops:
+  global_crops_size: 256            # 16x16 = 256 patch tokens
+  local_crops_size: 112             # 7x7 = 49 patch tokens
+
+# Step-based schedule (steps, not epochs). 100k steps @ bs512 ~= 40 IN-1k epochs.
+schedule:
+  enabled: true
+  total_steps: 100000
+  warmup_steps: 10000
+  freeze_last_layer_steps: 1000
+  teacher_temp_warmup_steps: 30000
+
+optim:
+  scaling_rule: sqrt_wrt_1024       # effective lr = 0.001 * 4*sqrt(512/1024) ~= 2.8e-3
+
+# Disable the built-in teacher-checkpoint eval dump (we use MBO instead).
+evaluation:
+  eval_period_iterations: 0
+
+checkpointing:
+  period: 5000
+  max_to_keep: 3
+
+register_viz:
+  enabled: true
+  every_n_steps: 2500
+  num_images: 8
+  layer: -1
+  dataset: ImageNetPacked:split=VAL:root=~/datasets/imagenet1k_packed
+  image_size: 256
+
+mbo:
+  enabled: true
+  every_n_steps: 5000
+  coco_root: ~/datasets/coco
+  split: val2017
+  max_images: 2000
+  layer: -1
+  image_size: 256
+  instance: true
+  semantic: true

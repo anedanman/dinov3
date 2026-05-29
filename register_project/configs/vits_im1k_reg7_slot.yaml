@@ -1,0 +1,80 @@
+# ===========================================================================
+# DINOv3 ViT-S/16 pretraining on ImageNet-1k  --  SLOT-REGISTER variant
+#
+# Identical to vits_im1k_reg7_baseline.yaml EXCEPT the register tokens use
+# slot-attention-style competition:
+#   * registers never attend to other registers (incl. themselves),
+#   * register->(cls+patch) logits are softmaxed across the register/query
+#     dimension (competition), then key-renormalized (slot_mode=slot).
+# All other tokens behave exactly as in the baseline and may attend to registers.
+#
+# Merged on top of dinov3/configs/ssl_default_config.yaml.
+# Launch:  register_project/scripts/train_slot.sh
+# ===========================================================================
+MODEL:
+  META_ARCHITECTURE: SSLMetaArch
+
+train:
+  # Effective batch 512 = 128 micro-batch x 4 grad-accum steps (single 95GB GPU, 31GB host RAM).
+  batch_size_per_gpu: 128
+  grad_accum_steps: 4
+  dataset_path: ImageNetPacked:split=TRAIN:root=~/datasets/imagenet1k_packed
+  num_workers: 8
+  compile: true
+  OFFICIAL_EPOCH_LENGTH: 1          # overwritten by the step-based schedule normalizer
+  wandb:
+    enabled: true
+    project: dinov3-registers
+    name: vits-reg7-slot
+    tags: [vits, reg7, slot, slot-attn]
+    log_freq: 10
+
+student:
+  arch: vit_small
+  patch_size: 16
+  drop_path_rate: 0.1
+  layerscale: 1.0e-05
+  n_storage_tokens: 7               # 7 register / slot tokens
+  register_attn_type: slot          # <-- slot-register competition attention
+  slot_mode: slot                   # "slot" (key-renormalized weighted mean) or "literal"
+
+# DINOv3 default crop resolution (256 global / 112 local).
+crops:
+  global_crops_size: 256            # 16x16 = 256 patch tokens
+  local_crops_size: 112             # 7x7 = 49 patch tokens
+
+schedule:
+  enabled: true
+  total_steps: 100000
+  warmup_steps: 10000
+  freeze_last_layer_steps: 1000
+  teacher_temp_warmup_steps: 30000
+
+optim:
+  scaling_rule: sqrt_wrt_1024
+
+evaluation:
+  eval_period_iterations: 0
+
+checkpointing:
+  period: 5000
+  max_to_keep: 3
+
+register_viz:
+  enabled: true
+  every_n_steps: 2500
+  num_images: 8
+  layer: -1
+  dataset: ImageNetPacked:split=VAL:root=~/datasets/imagenet1k_packed
+  image_size: 256
+
+mbo:
+  enabled: true
+  every_n_steps: 5000
+  coco_root: ~/datasets/coco
+  split: val2017
+  max_images: 2000
+  layer: -1
+  image_size: 256
+  instance: true
+  semantic: true
