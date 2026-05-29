@@ -50,15 +50,17 @@ def log_scalars(run, metrics: dict, step: int):
     run.log({k: v for k, v in metrics.items()}, step=step)
 
 
-def log_images(run, panels, step: int, key: str = "register_attention", captions=None):
-    """Log a list of HxWx3 uint8 numpy arrays as a wandb image gallery."""
+def log_images(run, panels, step: int, key: str = "register_attention", caption=None):
+    """Stack a list of HxWx3 uint8 numpy arrays vertically and log as one image."""
     if run is None or not panels:
         return
+    import numpy as np
     import wandb
 
-    if captions is None:
-        captions = [f"img_{i}" for i in range(len(panels))]
-    run.log({key: [wandb.Image(p, caption=c) for p, c in zip(panels, captions)]}, step=step)
+    grid = np.concatenate(panels, axis=0)  # stack panels vertically -> single image
+    if caption is None:
+        caption = f"{len(panels)} images"
+    run.log({key: wandb.Image(grid, caption=caption)}, step=step)
 
 
 def finish(run):

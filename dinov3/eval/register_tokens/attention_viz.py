@@ -18,6 +18,10 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
+def _empty_target_transform(_):
+    return ()
+
+
 def _denormalize(img: torch.Tensor, mean, std) -> np.ndarray:
     """[3,H,W] normalized tensor -> [H,W,3] uint8."""
     mean = torch.tensor(mean, device=img.device).view(3, 1, 1)
@@ -62,7 +66,7 @@ def load_viz_images(cfg, num_images: int) -> Tuple[torch.Tensor, List[np.ndarray
         resize_size=size, crop_size=size, resize_square=True, mean=mean, std=std
     )
     dataset_str = _expand(cfg.register_viz.dataset)
-    dataset = make_dataset(dataset_str=dataset_str, transform=transform, target_transform=lambda _: ())
+    dataset = make_dataset(dataset_str=dataset_str, transform=transform, target_transform=_empty_target_transform)
     # Deterministic, evenly spaced indices for stable tracking across training.
     n = min(num_images, len(dataset))
     idxs = np.linspace(0, len(dataset) - 1, n).astype(int)

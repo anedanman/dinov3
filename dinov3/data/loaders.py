@@ -198,6 +198,9 @@ def make_data_loader(
     persistent_workers: bool = False,
     collate_fn: Optional[Callable[[List[T]], Any]] = None,
     worker_init_fn: Optional[Callable[[List[T]], Any]] = None,
+    pin_memory: bool = True,
+    prefetch_factor: Optional[int] = None,
+    multiprocessing_context: Optional[str] = None,
 ):
     """
     Creates a data loader with the specified parameters.
@@ -215,6 +218,9 @@ def make_data_loader(
         persistent_workers: maintain the workers Dataset instances alive after a dataset has been consumed once.
         collate_fn: Function that performs batch collation
         worker_init_fn: Optional init function for each dataloader worker.
+        pin_memory: Whether to use pinned host-memory batches for GPU transfers.
+        prefetch_factor: Number of batches loaded in advance by each worker.
+        multiprocessing_context: Optional multiprocessing start method for worker processes.
     """
 
     sampler = _make_sampler(
@@ -226,18 +232,28 @@ def make_data_loader(
         advance=sampler_advance,
     )
 
-    logger.info("using PyTorch data loader")
-    data_loader = torch.utils.data.DataLoader(
-        dataset,
+    logger.info(
+        "using PyTorch data loader "
+        f"(pin_memory={pin_memory}, prefetch_factor={prefetch_factor}, "
+        f"multiprocessing_context={multiprocessing_context})"
+    )
+    loader_kwargs = dict(
         sampler=sampler,
         batch_size=batch_size,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         drop_last=drop_last,
         persistent_workers=persistent_workers,
         collate_fn=collate_fn,
         worker_init_fn=worker_init_fn,
     )
+    if num_workers > 0:
+        if prefetch_factor is not None:
+            loader_kwargs["prefetch_factor"] = prefetch_factor
+        if multiprocessing_context is not None:
+            loader_kwargs["multiprocessing_context"] = multiprocessing_context
+
+    data_loader = torch.utils.data.DataLoader(dataset, **loader_kwargs)
 
     try:
         logger.info(f"# of batches: {len(data_loader):,d}")

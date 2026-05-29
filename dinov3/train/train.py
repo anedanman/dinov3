@@ -50,6 +50,10 @@ torch.backends.cudnn.benchmark = False  # True
 logger = logging.getLogger("dinov3")
 
 
+def _empty_target_transform(_):
+    return ()
+
+
 def get_args_parser(add_help: bool = True):
     parser = argparse.ArgumentParser("DINOv3 training", add_help=add_help)
     parser.add_argument("--config-file", default="", metavar="FILE", help="path to config file")
@@ -314,7 +318,7 @@ def build_data_loader_from_cfg(
     dataset = make_dataset(
         dataset_str=dataset_path,
         transform=model.build_data_augmentation_dino(cfg),
-        target_transform=lambda _: (),
+        target_transform=_empty_target_transform,
     )
 
     if isinstance(dataset, torch.utils.data.IterableDataset):
@@ -334,6 +338,9 @@ def build_data_loader_from_cfg(
         sampler_advance=start_iter * dataloader_batch_size_per_gpu * grad_accum,
         drop_last=True,
         collate_fn=collate_fn,
+        pin_memory=cfg.train.get("pin_memory", True),
+        prefetch_factor=cfg.train.get("prefetch_factor", None),
+        multiprocessing_context=cfg.train.get("dataloader_multiprocessing_context", None),
     )
     return data_loader
 

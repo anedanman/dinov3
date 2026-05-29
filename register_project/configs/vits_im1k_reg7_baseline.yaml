@@ -17,9 +17,10 @@ train:
   grad_accum_steps: 4
   dataset_path: ImageNetPacked:split=TRAIN:root=~/datasets/imagenet1k_packed
   num_workers: 8
-  # compile=true leaks host RAM (~0.3 GB/min via Inductor) and OOMs a 31GB box in ~50 min.
-  # Keep false here; re-enable only on a high-RAM machine.
-  compile: false
+  pin_memory: false
+  prefetch_factor: 1
+  dataloader_multiprocessing_context: forkserver
+  compile: true
   OFFICIAL_EPOCH_LENGTH: 1          # overwritten by the step-based schedule normalizer
   wandb:
     enabled: true
@@ -44,7 +45,7 @@ crops:
 # Step-based schedule (steps, not epochs). 100k steps @ bs512 ~= 40 IN-1k epochs.
 schedule:
   enabled: true
-  total_steps: 100000
+  total_steps: 200000
   warmup_steps: 10000
   freeze_last_layer_steps: 1000
   teacher_temp_warmup_steps: 30000

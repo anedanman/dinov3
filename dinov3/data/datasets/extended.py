@@ -3,11 +3,53 @@
 # This software may be used and distributed in accordance with
 # the terms of the DINOv3 License Agreement.
 
-from typing import Any, Tuple
+import ctypes
+import os
+from typing import Any, Callable, Tuple
 
 from torchvision.datasets import VisionDataset
 
 from .decoders import Decoder, ImageDataDecoder, TargetDecoder
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+# Explicit per-item malloc_trim(0) is an expensive heap walk in the dataloader
+# hot path. Default off (0) for throughput; glibc still returns freed memory
+# lazily via MALLOC_TRIM_THRESHOLD_. Set DINOV3_DATASET_MALLOC_TRIM_EVERY>0 to
+# re-enable periodic trimming on RAM-constrained machines.
+_MALLOC_TRIM_EVERY = _env_int("DINOV3_DATASET_MALLOC_TRIM_EVERY", 0)
+_MALLOC_TRIM_COUNTER = 0
+_MALLOC_TRIM: Callable[[int], int] | bool | None = None
+
+
+def _maybe_trim_worker_heap() -> None:
+    """Periodically return freed decoder/augmentation arenas from workers to the OS."""
+    global _MALLOC_TRIM_COUNTER, _MALLOC_TRIM
+
+    if _MALLOC_TRIM_EVERY <= 0:
+        return
+
+    _MALLOC_TRIM_COUNTER += 1
+    if _MALLOC_TRIM_COUNTER % _MALLOC_TRIM_EVERY != 0:
+        return
+
+    if _MALLOC_TRIM is None:
+        try:
+            trim = ctypes.CDLL("libc.so.6").malloc_trim
+            trim.argtypes = [ctypes.c_size_t]
+            trim.restype = ctypes.c_int
+            _MALLOC_TRIM = trim
+        except (AttributeError, OSError):
+            _MALLOC_TRIM = False
+
+    if _MALLOC_TRIM:
+        _MALLOC_TRIM(0)
 
 
 class ExtendedVisionDataset(VisionDataset):
@@ -40,6 +82,8 @@ class ExtendedVisionDataset(VisionDataset):
         if self.transforms is not None:
             image, target = self.transforms(image, target)
 
+        del image_data
+        _maybe_trim_worker_heap()
         return image, target
 
     def __len__(self) -> int:

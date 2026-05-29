@@ -15,6 +15,36 @@ import dinov3.distributed as distributed
 
 logger = logging.getLogger("dinov3")
 
+_HOST_MEMORY_PROC = None
+_HOST_MEMORY_AVAILABLE = True
+
+
+def _get_host_memory_mb():
+    """Return current process-tree RSS and system available memory in MiB."""
+    global _HOST_MEMORY_PROC, _HOST_MEMORY_AVAILABLE
+
+    if not _HOST_MEMORY_AVAILABLE:
+        return None
+    try:
+        import psutil
+    except ImportError:
+        _HOST_MEMORY_AVAILABLE = False
+        return None
+
+    try:
+        if _HOST_MEMORY_PROC is None:
+            _HOST_MEMORY_PROC = psutil.Process()
+        rss = _HOST_MEMORY_PROC.memory_info().rss
+        for child in _HOST_MEMORY_PROC.children(recursive=True):
+            try:
+                rss += child.memory_info().rss
+            except psutil.Error:
+                pass
+        available = psutil.virtual_memory().available
+    except psutil.Error:
+        return None
+    return rss / (1024.0 * 1024.0), available / (1024.0 * 1024.0)
+
 
 class MetricLogger(object):
     def __init__(self, delimiter="\t", output_file=None):
@@ -87,6 +117,8 @@ class MetricLogger(object):
         if torch.cuda.is_available():
             log_list += ["mem: {current_memory:.0f}"]
             log_list += ["(max mem: {max_memory:.0f})"]
+        log_list += ["host rss: {host_rss:.0f}"]
+        log_list += ["host avail: {host_available:.0f}"]
 
         log_msg = self.delimiter.join(log_list)
         MB = 1024.0 * 1024.0
@@ -101,6 +133,18 @@ class MetricLogger(object):
                 self.dump_in_output_file(iteration=i, iter_time=iter_time.avg, data_time=data_time.avg)
                 eta_seconds = iter_time.global_avg * (n_iterations - i)
                 eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
+                host_memory = _get_host_memory_mb()
+                host_kwargs = {}
+                if host_memory is not None:
+                    host_kwargs = {
+                        "host_rss": host_memory[0],
+                        "host_available": host_memory[1],
+                    }
+                else:
+                    host_kwargs = {
+                        "host_rss": float("nan"),
+                        "host_available": float("nan"),
+                    }
                 if torch.cuda.is_available():
                     logger.info(
                         log_msg.format(
@@ -112,6 +156,7 @@ class MetricLogger(object):
                             data=str(data_time),
                             current_memory=torch.cuda.memory_allocated() / MB,
                             max_memory=torch.cuda.max_memory_allocated() / MB,
+                            **host_kwargs,
                         )
                     )
                 else:
@@ -123,6 +168,7 @@ class MetricLogger(object):
                             meters=str(self),
                             time=str(iter_time),
                             data=str(data_time),
+                            **host_kwargs,
                         )
                     )
             i += 1

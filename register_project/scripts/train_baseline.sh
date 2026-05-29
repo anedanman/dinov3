@@ -36,6 +36,8 @@ export PYTHONPATH="$REPO:${PYTHONPATH:-}"
 # GPU memory stays flat and gc.collect() (disabled in train.py) can't reclaim it.
 export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"        # fewer arenas -> less fragmentation
 export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-0}"  # return freed memory to the OS
+export DINOV3_DATASET_MALLOC_TRIM_EVERY="${DINOV3_DATASET_MALLOC_TRIM_EVERY:-128}"
+export DINOV3_PACKED_DROP_CACHE="${DINOV3_PACKED_DROP_CACHE:-1}"
 
 mkdir -p "$OUTPUT_DIR"
 

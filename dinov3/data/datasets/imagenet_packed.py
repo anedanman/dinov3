@@ -95,9 +95,12 @@ class ImageNetPacked(ExtendedVisionDataset):
         # Index is small; load eagerly. The blob is read with positional reads
         # (os.pread) rather than mmap'd: mapping the whole multi-hundred-GB blob
         # leaves every touched page resident per worker, so host RAM creeps up
-        # over a run. pread copies exactly the requested bytes and nothing lingers.
+        # over a run. pread copies exactly the requested bytes; we also advise the
+        # kernel to drop those pages because random SSL sampling has little reuse.
         self._index = np.load(self._index_path)
         self._fd = None  # opened lazily so the descriptor is created per DataLoader worker
+        self._drop_cache = os.environ.get("DINOV3_PACKED_DROP_CACHE", "1").lower() not in {"0", "false", "no"}
+        self._page_size = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
 
     @property
     def split(self) -> "ImageNetPacked.Split":
@@ -106,6 +109,11 @@ class ImageNetPacked(ExtendedVisionDataset):
     def _get_fd(self) -> int:
         if self._fd is None:
             self._fd = os.open(self._blob_path, os.O_RDONLY)
+            if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_RANDOM"):
+                try:
+                    os.posix_fadvise(self._fd, 0, 0, os.POSIX_FADV_RANDOM)
+                except OSError:
+                    pass
         return self._fd
 
     def get_image_data(self, index: int) -> bytes:
@@ -122,7 +130,21 @@ class ImageNetPacked(ExtendedVisionDataset):
             if not more:
                 break
             data += more
+        if len(data) != length:
+            raise OSError(f"short read from {self._blob_path}: got {len(data)} bytes, expected {length}")
+        if self._drop_cache:
+            self._drop_file_cache(fd, offset, length)
         return data
+
+    def _drop_file_cache(self, fd: int, offset: int, length: int) -> None:
+        if not (hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED")):
+            return
+        page_offset = offset - (offset % self._page_size)
+        page_length = offset + length - page_offset
+        try:
+            os.posix_fadvise(fd, page_offset, page_length, os.POSIX_FADV_DONTNEED)
+        except OSError:
+            pass
 
     def __del__(self):
         fd = getattr(self, "_fd", None)
