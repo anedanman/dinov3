@@ -30,14 +30,13 @@ export CONDA_PREFIX="$ENV_PREFIX"
 export CONDA_DEFAULT_ENV="$ENV_NAME"
 export PYTHONPATH="$REPO:${PYTHONPATH:-}"
 
-# Tame glibc host-RAM creep in the DataLoader workers (inherited by all forks).
-# Variable-size JPEG decode/augmentation fragments per-thread malloc arenas that
-# are never returned to the OS; on a low-RAM box this OOMs after hours even though
-# GPU memory stays flat and gc.collect() (disabled in train.py) can't reclaim it.
-export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"        # fewer arenas -> less fragmentation
-export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-0}"  # return freed memory to the OS
-export DINOV3_DATASET_MALLOC_TRIM_EVERY="${DINOV3_DATASET_MALLOC_TRIM_EVERY:-128}"
-export DINOV3_PACKED_DROP_CACHE="${DINOV3_PACKED_DROP_CACHE:-1}"
+# DataLoader host-RAM vs throughput knobs (all override-able). Defaults favor
+# TRAINING SPEED; on a RAM-constrained box use the low-RAM values in the comments.
+# glibc still returns freed memory to the OS lazily, just not on every free.
+export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-8}"                       # low-RAM: 2
+export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-268435456}"   # low-RAM: 0 (trim on every free)
+export DINOV3_DATASET_MALLOC_TRIM_EVERY="${DINOV3_DATASET_MALLOC_TRIM_EVERY:-0}"  # low-RAM: 128 (per-item heap walk)
+export DINOV3_PACKED_DROP_CACHE="${DINOV3_PACKED_DROP_CACHE:-0}"       # low-RAM: 1 (drop page cache after each read)
 
 mkdir -p "$OUTPUT_DIR"
 
