@@ -27,13 +27,24 @@ else
     conda create -y -n "$ENV_NAME" "python=${PYTHON_VERSION}"
 fi
 
+# Run pip without inheriting machine-level hash/constraint enforcement
+# (PIP_REQUIRE_HASHES / PIP_CONSTRAINT), which otherwise rejects our unpinned
+# requirements with "PACKAGES DO NOT MATCH THE HASHES". Set PIP_IGNORE_CONFIG=1
+# to additionally bypass pip.conf (also disables any configured mirror).
+PIP_IGNORE_CONFIG="${PIP_IGNORE_CONFIG:-0}"
+pip_install() {
+    local env_overrides=(env -u PIP_REQUIRE_HASHES -u PIP_CONSTRAINT)
+    if [[ "$PIP_IGNORE_CONFIG" == "1" ]]; then
+        env_overrides+=(PIP_CONFIG_FILE=/dev/null)
+    fi
+    conda run -n "$ENV_NAME" "${env_overrides[@]}" pip install --no-input --no-cache-dir "$@"
+}
+
 echo "[torch] installing torch==$TORCH_VERSION torchvision==$TORCHVISION_VERSION from $TORCH_INDEX_URL"
-conda run -n "$ENV_NAME" pip install --no-input \
-    "torch==${TORCH_VERSION}" "torchvision==${TORCHVISION_VERSION}" \
-    --index-url "$TORCH_INDEX_URL"
+pip_install "torch==${TORCH_VERSION}" "torchvision==${TORCHVISION_VERSION}" --index-url "$TORCH_INDEX_URL"
 
 echo "[deps] installing training requirements"
-conda run -n "$ENV_NAME" pip install --no-input -r "$REPO/register_project/requirements-train.txt"
+pip_install -r "$REPO/register_project/requirements-train.txt"
 
 echo "[verify] checking torch / CUDA"
 conda run -n "$ENV_NAME" python - <<'PY'
