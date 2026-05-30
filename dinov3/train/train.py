@@ -54,6 +54,50 @@ def _empty_target_transform(_):
     return ()
 
 
+def _format_mbo_metrics_for_wandb(metrics: dict) -> dict:
+    """Group MBO metrics in W&B by attention direction and GT target type."""
+    formatted = {}
+    aliases = {}
+    for key, value in metrics.items():
+        if key == "mbo_n_images":
+            formatted["mbo_metadata/n_images"] = value
+            continue
+        if key == "mbo_instance":
+            aliases["mbo_register2patches_instance/last"] = value
+            continue
+        if key == "mbo_semantic":
+            aliases["mbo_register2patches_semantic/last"] = value
+            continue
+
+        direction = None
+        rest = None
+        if key.startswith("mbo_register2patch_"):
+            direction = "register2patches"
+            rest = key[len("mbo_register2patch_") :]
+        elif key.startswith("mbo_patch2register_"):
+            direction = "patches2registers"
+            rest = key[len("mbo_patch2register_") :]
+
+        if direction is None:
+            formatted[f"mbo_metadata/{key.removeprefix('mbo_')}"] = value
+            continue
+
+        if rest.endswith("_instance"):
+            target = "instance"
+            variant = rest[: -len("_instance")]
+        elif rest.endswith("_semantic"):
+            target = "semantic"
+            variant = rest[: -len("_semantic")]
+        else:
+            formatted[f"mbo_metadata/{key.removeprefix('mbo_')}"] = value
+            continue
+        formatted[f"mbo_{direction}_{target}/{variant}"] = value
+
+    for key, value in aliases.items():
+        formatted.setdefault(key, value)
+    return formatted
+
+
 def get_args_parser(add_help: bool = True):
     parser = argparse.ArgumentParser("DINOv3 training", add_help=add_help)
     parser.add_argument("--config-file", default="", metavar="FILE", help="path to config file")
@@ -492,7 +536,7 @@ def do_train(cfg, model, resume=False):
             if run_mbo:
                 try:
                     mbo_metrics = register_evaluator.run_mbo()
-                    wandb_logger.log_scalars(wandb_run, {f"mbo/{k}": v for k, v in mbo_metrics.items()}, step=step)
+                    wandb_logger.log_scalars(wandb_run, _format_mbo_metrics_for_wandb(mbo_metrics), step=step)
                 except Exception as e:
                     logger.warning(f"MBO eval failed: {e}")
         model.train()
