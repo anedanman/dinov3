@@ -415,6 +415,7 @@ def do_train(cfg, model, resume=False):
         )
     model.init_weights()
     start_iter = 0
+    resumed_from_checkpoint = False
     if resume and (last_checkpoint_dir := find_latest_checkpoint(ckpt_dir)):
         logger.info(f"Checkpoint found {last_checkpoint_dir}")
         start_iter = (
@@ -427,6 +428,7 @@ def do_train(cfg, model, resume=False):
             )
             + 1
         )
+        resumed_from_checkpoint = True
     OFFICIAL_EPOCH_LENGTH = cfg.train.OFFICIAL_EPOCH_LENGTH
     max_iter = cfg.optim.epochs * OFFICIAL_EPOCH_LENGTH
     grad_accum = max(1, int(cfg.train.get("grad_accum_steps", 1)))
@@ -455,6 +457,56 @@ def do_train(cfg, model, resume=False):
                 return
             yield group
 
+    # Weights & Biases + register-token evaluator (viz + COCO MBO)
+    wandb_run = wandb_logger.init_wandb(cfg)
+    wandb_log_freq = cfg.train.get("wandb", {}).get("log_freq", 10) if cfg.train.get("wandb", None) else 10
+    register_evaluator = RegisterEvaluator(cfg)
+
+    def _synchronize_cuda():
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    def _run_register_validation(step: int, run_viz: bool, run_mbo: bool, reason: str):
+        if not (run_viz or run_mbo):
+            return
+        logger.info(
+            "Running register validation at step %d (%s): viz=%s mbo=%s",
+            step,
+            reason,
+            run_viz,
+            run_mbo,
+        )
+        _synchronize_cuda()
+        register_evaluator.sync(model)  # collective (full_tensor); all ranks must call
+        if distributed.is_main_process():
+            if run_viz:
+                try:
+                    viz_outputs = register_evaluator.run_viz()
+                    if isinstance(viz_outputs, dict):
+                        for key, panels in viz_outputs.items():
+                            wandb_logger.log_images(wandb_run, panels, step=step, key=key)
+                    else:
+                        wandb_logger.log_images(wandb_run, viz_outputs, step=step, key="register_attention")
+                except Exception as e:
+                    logger.warning(f"register viz failed: {e}")
+            if run_mbo:
+                try:
+                    mbo_metrics = register_evaluator.run_mbo()
+                    wandb_logger.log_scalars(wandb_run, {f"mbo/{k}": v for k, v in mbo_metrics.items()}, step=step)
+                except Exception as e:
+                    logger.warning(f"MBO eval failed: {e}")
+        model.train()
+        _synchronize_cuda()
+
+    if resumed_from_checkpoint:
+        # The checkpoint stores the state after iteration start_iter - 1.
+        _run_register_validation(
+            step=max(start_iter - 1, 0),
+            run_viz=register_evaluator.viz_enabled,
+            run_mbo=register_evaluator.mbo_enabled,
+            reason="checkpoint resume",
+        )
+
     # Build data loader
     data_loader = build_multi_resolution_data_loader_from_cfg(
         cfg=cfg,
@@ -467,10 +519,6 @@ def do_train(cfg, model, resume=False):
     metrics_file = os.path.join(cfg.train.output_dir, "training_metrics.json")
     metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file)
 
-    # Weights & Biases + register-token evaluator (viz + COCO MBO)
-    wandb_run = wandb_logger.init_wandb(cfg)
-    wandb_log_freq = cfg.train.get("wandb", {}).get("log_freq", 10) if cfg.train.get("wandb", None) else 10
-    register_evaluator = RegisterEvaluator(cfg)
     # Manual garbage collection
     gc.disable()
     gc.collect()
@@ -618,29 +666,7 @@ def do_train(cfg, model, resume=False):
         run_viz = register_evaluator.should_run_viz(iteration)
         run_mbo = register_evaluator.should_run_mbo(iteration)
         if run_viz or run_mbo:
-            torch.cuda.synchronize()
-            register_evaluator.sync(model)  # collective (full_tensor); all ranks must call
-            if distributed.is_main_process():
-                if run_viz:
-                    try:
-                        viz_outputs = register_evaluator.run_viz()
-                        if isinstance(viz_outputs, dict):
-                            for key, panels in viz_outputs.items():
-                                wandb_logger.log_images(wandb_run, panels, step=iteration, key=key)
-                        else:
-                            wandb_logger.log_images(wandb_run, viz_outputs, step=iteration, key="register_attention")
-                    except Exception as e:
-                        logger.warning(f"register viz failed: {e}")
-                if run_mbo:
-                    try:
-                        mbo_metrics = register_evaluator.run_mbo()
-                        wandb_logger.log_scalars(
-                            wandb_run, {f"mbo/{k}": v for k, v in mbo_metrics.items()}, step=iteration
-                        )
-                    except Exception as e:
-                        logger.warning(f"MBO eval failed: {e}")
-            model.train()
-            torch.cuda.synchronize()
+            _run_register_validation(iteration, run_viz, run_mbo, reason="scheduled")
 
         # Submit evaluation jobs
         if (
