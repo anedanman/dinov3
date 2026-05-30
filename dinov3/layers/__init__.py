@@ -8,6 +8,7 @@ from .attention import (
     LinearKMaskedBias,
     RegisterSlotAttention,
     SelfAttention,
+    extract_register_attention_maps,
     extract_register_patch_attention,
 )
 from .block import CausalSelfAttentionBlock, SelfAttentionBlock

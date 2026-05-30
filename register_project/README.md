@@ -115,15 +115,18 @@ Outputs (checkpoints, logs, `config.yaml`) land in `runs/<name>/`.
   `slot_mode="literal"` uses `out = A @ V`. All non-register tokens are
   unchanged and may attend to registers.
   Implemented as fast SDPA for the bulk + explicit competition for register rows.
-- `extract_register_patch_attention(...)`: register→patch weights for viz/MBO,
-  consistent with the model's attention type.
+- `extract_register_attention_maps(...)`: register→patch and patch→register
+  weights for viz/MBO, plus matching CLS maps. `extract_register_patch_attention(...)`
+  remains as the register→patch compatibility wrapper.
 
 **Model wiring** — `dinov3/models/vision_transformer.py`, `dinov3/models/__init__.py`
 - `register_attn_type` (`standard`|`slot`), `slot_mode`,
   `register_attn_exclude_cls`, and `register_init` flow from config.
 - `register_init="gaussian"` samples per-image register tokens from trainable
   per-register mean/log-std parameters.
-- `DinoVisionTransformer.get_register_patch_attention(x, layer)` → `[B, R, H, W]`.
+- `DinoVisionTransformer.get_register_attention_maps(...)` returns either
+  head-averaged `[B, R, H, W]` masks or per-head `[B, heads, R, H, W]` masks.
+  `get_register_patch_attention(x, layer)` remains as the register→patch wrapper.
 
 **Config** — `dinov3/configs/ssl_default_config.yaml`
 - `student.register_attn_type`, `student.slot_mode`,
@@ -156,8 +159,11 @@ Outputs (checkpoints, logs, `config.yaml`) land in `runs/<name>/`.
 ## Notes & defaults
 
 - **Registers attend to cls + patches only**, never to any register (incl. self).
-- **Viz/MBO masks** come from the **last block**, attention averaged over heads,
-  bilinearly upsampled. Change via `register_viz.layer` / `mbo.layer`.
+- **Viz/MBO masks** include register→patch and patch→register views. COCO
+  validation also reports last block, penultimate block, all-layer averaged,
+  second-half-layer averaged, and last-block per-head masks. The legacy
+  `mbo_instance` / `mbo_semantic` keys remain aliases for last-block
+  register→patch.
 - **MBO** turns register attention into segments via per-pixel argmax over
   registers, then reports mean-best-IoU vs COCO GT (instance = per-object,
   semantic = per-category). GT from `instances_val2017.json` (things classes).

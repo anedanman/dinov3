@@ -24,7 +24,7 @@ match the attention grid).
 import logging
 import os
 from collections import defaultdict
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -65,6 +65,44 @@ def _best_overlaps(gt_masks: List[torch.Tensor], pred_onehot: torch.Tensor) -> L
     return out
 
 
+def _attention_specs(cfg) -> List[Tuple[str, int, str, str]]:
+    """(name, layer, layer_reduce, head_reduce) specs used for validation."""
+    layer = int(cfg.mbo.get("layer", -1))
+    return [
+        ("last", layer, "select", "mean"),
+        ("penultimate", -2, "select", "mean"),
+        ("all_layers", layer, "mean", "mean"),
+        ("second_half_layers", layer, "second_half", "mean"),
+        ("last_per_head", layer, "select", "none"),
+    ]
+
+
+def _reduce_attention(collection, direction: str, layer: int, layer_reduce: str, head_reduce: str) -> torch.Tensor:
+    H, W = collection["spatial_size"]
+    masks = collection[direction]["masks"]  # [L,B,h,R,P]
+    if layer_reduce == "mean":
+        masks = masks.mean(dim=0)  # [B,h,R,P]
+    elif layer_reduce == "second_half":
+        start = masks.shape[0] // 2
+        masks = masks[start:].mean(dim=0)  # [B,h,R,P]
+    else:
+        layer_ids = collection["layers"]
+        layer_idx = layer_ids.index(int(layer) % len(layer_ids))
+        masks = masks[layer_idx]  # [B,h,R,P]
+    B, heads, R, _ = masks.shape
+    if head_reduce == "mean":
+        masks = masks.mean(dim=1)  # [B,R,P]
+        return masks.reshape(B, R, H, W)
+    return masks.reshape(B, heads * R, H, W)
+
+
+def _interpolate_masks(attn: torch.Tensor, size: int, mode: str) -> torch.Tensor:
+    kwargs = {"size": (size, size), "mode": mode}
+    if mode in ("linear", "bilinear", "bicubic", "trilinear"):
+        kwargs["align_corners"] = False
+    return F.interpolate(attn, **kwargs)
+
+
 @torch.no_grad()
 def compute_coco_mbo(
     eval_backbone,
@@ -100,6 +138,14 @@ def compute_coco_mbo(
 
     inst_overlaps: List[float] = []
     sem_overlaps: List[float] = []
+    variant_overlaps = {}
+    directions = ("register_to_patch", "patch_to_register")
+    direction_names = {"register_to_patch": "register2patch", "patch_to_register": "patch2register"}
+    specs = _attention_specs(cfg)
+    for direction in directions:
+        for name, _, _, _ in specs:
+            variant_overlaps[(direction, name, "instance")] = []
+            variant_overlaps[(direction, name, "semantic")] = []
     n_used = 0
 
     # Process in batches for backbone efficiency.
@@ -110,16 +156,28 @@ def compute_coco_mbo(
         if not batch_imgs:
             return
         x = torch.stack(batch_imgs, dim=0).to(device)
-        attn = eval_backbone.get_register_patch_attention(x, layer=mcfg.layer)  # [B,R,h,w]
-        attn = F.interpolate(attn, size=(size, size), mode=mcfg.upsample, align_corners=False)
-        assign = attn.argmax(dim=1)  # [B,S,S]
-        R = attn.shape[1]
+        collection = eval_backbone.get_register_attention_layers(x, directions=directions)
+        assignments = {}
+        for direction in directions:
+            for name, layer, layer_reduce, head_reduce in specs:
+                attn = _reduce_attention(collection, direction, layer, layer_reduce, head_reduce)
+                attn = _interpolate_masks(attn, size=size, mode=mcfg.upsample)
+                assignments[(direction, name)] = (attn.argmax(dim=1), attn.shape[1])  # [B,S,S], num masks
         for b, meta in enumerate(batch_meta):
-            pred_onehot = F.one_hot(assign[b], num_classes=R).permute(2, 0, 1).bool()  # [R,S,S]
-            if mcfg.instance and meta["instances"]:
-                inst_overlaps.extend(_best_overlaps(meta["instances"], pred_onehot))
-            if mcfg.semantic and meta["semantic"]:
-                sem_overlaps.extend(_best_overlaps(meta["semantic"], pred_onehot))
+            for direction in directions:
+                for name, _, _, _ in specs:
+                    assign, n_masks = assignments[(direction, name)]
+                    pred_onehot = F.one_hot(assign[b], num_classes=n_masks).permute(2, 0, 1).bool()
+                    if mcfg.instance and meta["instances"]:
+                        overlaps = _best_overlaps(meta["instances"], pred_onehot)
+                        variant_overlaps[(direction, name, "instance")].extend(overlaps)
+                        if direction == "register_to_patch" and name == "last":
+                            inst_overlaps.extend(overlaps)
+                    if mcfg.semantic and meta["semantic"]:
+                        overlaps = _best_overlaps(meta["semantic"], pred_onehot)
+                        variant_overlaps[(direction, name, "semantic")].extend(overlaps)
+                        if direction == "register_to_patch" and name == "last":
+                            sem_overlaps.extend(overlaps)
             n_used += 1
         batch_imgs.clear()
         batch_meta.clear()
@@ -159,5 +217,16 @@ def compute_coco_mbo(
         out["mbo_instance"] = float(np.mean(inst_overlaps))
     if mcfg.semantic and sem_overlaps:
         out["mbo_semantic"] = float(np.mean(sem_overlaps))
+    for direction in directions:
+        direction_name = direction_names[direction]
+        for name, _, _, _ in specs:
+            if mcfg.instance:
+                values = variant_overlaps[(direction, name, "instance")]
+                if values:
+                    out[f"mbo_{direction_name}_{name}_instance"] = float(np.mean(values))
+            if mcfg.semantic:
+                values = variant_overlaps[(direction, name, "semantic")]
+                if values:
+                    out[f"mbo_{direction_name}_{name}_semantic"] = float(np.mean(values))
     logger.info(f"[MBO] {out}")
     return out

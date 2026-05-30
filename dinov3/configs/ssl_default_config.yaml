@@ -218,6 +218,8 @@ register_viz:
   layer: -1                 # which block's register attention to read (-1 = last)
   dataset: ImageNetPacked:split=VAL:root=~/datasets/imagenet1k_packed  # source of viz images
   image_size: 224
+  coco: true                # also render COCO validation panels for MBO variants
+  coco_num_images: null     # null = reuse num_images
 
 mbo:
   enabled: false
@@ -230,6 +232,9 @@ mbo:
   upsample: bilinear        # how to upsample register attention to image resolution
   semantic: true            # compute semantic MBO (panoptic stuff+things merged by category)
   instance: true            # compute instance MBO (per-object masks)
+  # Validation reports register2patch and patch2register masks for:
+  # last, penultimate, all-layer average, second-half-layer average, and
+  # last-layer per-head masks.
 
 # Example of constant schedules with schedules v2
 # # schedules:

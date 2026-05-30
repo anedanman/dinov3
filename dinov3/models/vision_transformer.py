@@ -23,7 +23,7 @@ from dinov3.layers import (
     SelfAttentionBlock,
     SwiGLUFFN,
 )
-from dinov3.layers.attention import extract_register_patch_attention
+from dinov3.layers.attention import extract_register_attention_maps
 from dinov3.utils import named_apply
 
 logger = logging.getLogger("dinov3")
@@ -376,6 +376,117 @@ class DinoVisionTransformer(nn.Module):
         elif return_class_token and return_extra_tokens:
             return tuple(zip(outputs, class_tokens, extra_tokens))
 
+    def _normalize_attention_layers(self, layers: Optional[Sequence[int]] = None) -> List[int]:
+        if layers is None:
+            return list(range(self.n_blocks))
+        out = sorted({int(layer) % self.n_blocks for layer in layers})
+        assert len(out) > 0, "at least one attention layer must be requested"
+        return out
+
+    @torch.no_grad()
+    def get_register_attention_layers(
+        self,
+        x: Tensor,
+        layers: Optional[Sequence[int]] = None,
+        directions: Sequence[str] = ("register_to_patch", "patch_to_register"),
+    ) -> Dict[str, Any]:
+        """Collect raw per-head register attention maps at selected blocks.
+
+        Returns a dict with ``spatial_size``, ``layers`` and one entry per
+        direction. Direction entries contain:
+          * masks: [L, B, heads, R, H*W]
+          * cls:   [L, B, heads, H*W]
+        """
+        assert self.n_storage_tokens > 0, "no register tokens to visualize"
+        directions = tuple(directions)
+        for direction in directions:
+            assert direction in ("register_to_patch", "patch_to_register"), f"unknown direction={direction}"
+        target_layers = self._normalize_attention_layers(layers)
+        target_set = set(target_layers)
+        last_needed = max(target_set)
+
+        x, (H, W) = self.prepare_tokens_with_masks(x)
+        masks_by_direction = {direction: [] for direction in directions}
+        cls_by_direction = {direction: [] for direction in directions}
+        seen_layers = []
+        for i, blk in enumerate(self.blocks):
+            rope = self.rope_embed(H=H, W=W) if self.rope_embed is not None else None
+            if i in target_set:
+                normed = blk.norm1(x)
+                qkv = blk.attn.qkv(normed)
+                for direction in directions:
+                    masks, cls_map = extract_register_attention_maps(
+                        qkv,
+                        num_heads=self.num_heads,
+                        n_storage_tokens=self.n_storage_tokens,
+                        scale=blk.attn.scale,
+                        rope=rope,
+                        apply_rope_fn=blk.attn.apply_rope,
+                        attn_type=self.register_attn_type,
+                        slot_renorm=(self.slot_mode == "slot"),
+                        slot_exclude_cls=self.register_attn_exclude_cls,
+                        direction=direction,
+                    )
+                    masks_by_direction[direction].append(masks)
+                    cls_by_direction[direction].append(cls_map)
+                seen_layers.append(i)
+                if i == last_needed:
+                    break
+            x = blk(x, rope)
+        assert seen_layers == target_layers, f"only collected layers {seen_layers}, expected {target_layers}"
+        out: Dict[str, Any] = {"spatial_size": (H, W), "layers": seen_layers}
+        for direction in directions:
+            out[direction] = {
+                "masks": torch.stack(masks_by_direction[direction], dim=0),
+                "cls": torch.stack(cls_by_direction[direction], dim=0),
+            }
+        return out
+
+    @torch.no_grad()
+    def get_register_attention_maps(
+        self,
+        x: Tensor,
+        layer: int = -1,
+        direction: str = "register_to_patch",
+        layer_reduce: str = "select",
+        head_reduce: str = "mean",
+    ) -> Tuple[Tensor, Tensor]:
+        """Register attention masks and CLS map for one direction.
+
+        ``layer_reduce`` is ``select``, ``mean`` or ``second_half``.
+        ``head_reduce`` is ``mean`` or ``none``. Mean-head output shapes are
+        ``[B, R, H, W]`` and ``[B, H, W]``. Per-head output shapes are
+        ``[B, heads, R, H, W]`` and ``[B, heads, H, W]``.
+        """
+        assert layer_reduce in ("select", "mean", "second_half"), f"unknown layer_reduce={layer_reduce}"
+        assert head_reduce in ("mean", "none"), f"unknown head_reduce={head_reduce}"
+        layers = None if layer_reduce in ("mean", "second_half") else [layer]
+        collection = self.get_register_attention_layers(x, layers=layers, directions=(direction,))
+        H, W = collection["spatial_size"]
+        masks = collection[direction]["masks"]  # [L,B,h,R,P]
+        cls_map = collection[direction]["cls"]  # [L,B,h,P]
+        if layer_reduce == "mean":
+            masks = masks.mean(dim=0)
+            cls_map = cls_map.mean(dim=0)
+        elif layer_reduce == "second_half":
+            start = masks.shape[0] // 2
+            masks = masks[start:].mean(dim=0)
+            cls_map = cls_map[start:].mean(dim=0)
+        else:
+            masks = masks[0]
+            cls_map = cls_map[0]
+        if head_reduce == "mean":
+            masks = masks.mean(dim=1)  # [B,R,P]
+            cls_map = cls_map.mean(dim=1)  # [B,P]
+            return (
+                masks.reshape(masks.shape[0], self.n_storage_tokens, H, W),
+                cls_map.reshape(cls_map.shape[0], H, W),
+            )
+        return (
+            masks.reshape(masks.shape[0], self.num_heads, self.n_storage_tokens, H, W),
+            cls_map.reshape(cls_map.shape[0], self.num_heads, H, W),
+        )
+
     @torch.no_grad()
     def get_register_patch_attention(self, x: Tensor, layer: int = -1) -> Tensor:
         """Register-token -> patch attention maps for visualization / MBO masks.
@@ -386,29 +497,14 @@ class DinoVisionTransformer(nn.Module):
 
         Returns: [B, R, H, W] attention maps (R = n_storage_tokens).
         """
-        assert self.n_storage_tokens > 0, "no register tokens to visualize"
-        x, (H, W) = self.prepare_tokens_with_masks(x)
-        target = layer % self.n_blocks
-        for i, blk in enumerate(self.blocks):
-            rope = self.rope_embed(H=H, W=W) if self.rope_embed is not None else None
-            if i == target:
-                normed = blk.norm1(x)
-                qkv = blk.attn.qkv(normed)
-                attn = extract_register_patch_attention(
-                    qkv,
-                    num_heads=self.num_heads,
-                    n_storage_tokens=self.n_storage_tokens,
-                    scale=blk.attn.scale,
-                    rope=rope,
-                    apply_rope_fn=blk.attn.apply_rope,
-                    attn_type=self.register_attn_type,
-                    slot_renorm=(self.slot_mode == "slot"),
-                    slot_exclude_cls=self.register_attn_exclude_cls,
-                )  # [B, heads, R, P]
-                attn = attn.mean(dim=1)  # [B, R, P]
-                return attn.reshape(attn.shape[0], self.n_storage_tokens, H, W)
-            x = blk(x, rope)
-        raise RuntimeError("target block not reached")
+        attn, _ = self.get_register_attention_maps(
+            x,
+            layer=layer,
+            direction="register_to_patch",
+            layer_reduce="select",
+            head_reduce="mean",
+        )
+        return attn
 
     def forward(self, *args, is_training: bool = False, **kwargs) -> List[Dict[str, Tensor]] | Tensor:
         ret = self.forward_features(*args, **kwargs)

@@ -623,8 +623,12 @@ def do_train(cfg, model, resume=False):
             if distributed.is_main_process():
                 if run_viz:
                     try:
-                        panels = register_evaluator.run_viz()
-                        wandb_logger.log_images(wandb_run, panels, step=iteration, key="register_attention")
+                        viz_outputs = register_evaluator.run_viz()
+                        if isinstance(viz_outputs, dict):
+                            for key, panels in viz_outputs.items():
+                                wandb_logger.log_images(wandb_run, panels, step=iteration, key=key)
+                        else:
+                            wandb_logger.log_images(wandb_run, viz_outputs, step=iteration, key="register_attention")
                     except Exception as e:
                         logger.warning(f"register viz failed: {e}")
                 if run_mbo:

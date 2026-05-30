@@ -172,6 +172,77 @@ def compute_register_competition(
 
 
 @torch.no_grad()
+def extract_register_attention_maps(
+    qkv: Tensor,
+    num_heads: int,
+    n_storage_tokens: int,
+    scale: float,
+    rope=None,
+    apply_rope_fn=None,
+    attn_type: str = "standard",
+    slot_renorm: bool = True,
+    slot_exclude_cls: bool = True,
+    direction: str = "register_to_patch",
+) -> Tuple[Tensor, Tensor]:
+    """Compute register masks and the matching CLS map for viz / MBO.
+
+    Returns:
+        masks: [B, heads, R, P], where R is the number of registers and P is
+            the number of patch tokens.
+        cls_map: [B, heads, P], using the analogous CLS direction:
+            cls->patch for register_to_patch, patch->cls for patch_to_register.
+
+    For register_to_patch, masks use the same softmax convention the model was
+    trained with:
+      * "standard": softmax over all keys, then read off the patch columns.
+      * "slot": competition softmax over the register dimension (registers vs
+        patches, optionally cls), optionally key-renormalized, then read off
+        patch columns.
+
+    For patch_to_register, patch rows behave as standard attention for both the
+    baseline and slot-register model; non-register rows are unchanged by
+    RegisterSlotAttention.
+    """
+    assert direction in ("register_to_patch", "patch_to_register"), f"unknown direction={direction}"
+    B, N, _ = qkv.shape
+    C = qkv.shape[-1] // 3
+    qkv = qkv.reshape(B, N, 3, num_heads, C // num_heads)
+    q, k, _ = torch.unbind(qkv, 2)
+    q, k = q.transpose(1, 2), k.transpose(1, 2)
+    if rope is not None and apply_rope_fn is not None:
+        q, k = apply_rope_fn(q, k, rope)
+    R = n_storage_tokens
+    P = N - 1 - R
+
+    if direction == "register_to_patch":
+        q_reg = q[:, :, 1 : 1 + R, :].float()
+        if attn_type == "slot":
+            k_nr = _split_register_keys(k, R, exclude_cls=slot_exclude_cls).float()  # [B,h,P or 1+P,d]
+            logits = torch.matmul(q_reg, k_nr.transpose(-2, -1)) * scale  # [B,h,R,P or 1+P]
+            masks = torch.softmax(logits, dim=-2)  # competition across registers
+            if slot_renorm:
+                masks = masks / (masks.sum(dim=-1, keepdim=True) + 1e-8)
+            masks = masks if slot_exclude_cls else masks[:, :, :, 1:]
+        else:
+            logits = torch.matmul(q_reg, k.float().transpose(-2, -1)) * scale  # [B,h,R,N]
+            attn = torch.softmax(logits, dim=-1)  # over all keys
+            masks = attn[:, :, :, 1 + R :]  # patch columns -> [B,h,R,P]
+
+        q_cls = q[:, :, :1, :].float()
+        cls_logits = torch.matmul(q_cls, k.float().transpose(-2, -1)) * scale  # [B,h,1,N]
+        cls_map = torch.softmax(cls_logits, dim=-1)[:, :, 0, 1 + R :]  # [B,h,P]
+        return masks, cls_map
+
+    q_patch = q[:, :, 1 + R :, :].float()  # [B,h,P,d]
+    logits = torch.matmul(q_patch, k.float().transpose(-2, -1)) * scale  # [B,h,P,N]
+    attn = torch.softmax(logits, dim=-1)
+    masks = attn[:, :, :, 1 : 1 + R].transpose(-2, -1)  # [B,h,R,P]
+    cls_map = attn[:, :, :, 0]  # patch->cls, [B,h,P]
+    assert masks.shape[-1] == P
+    return masks, cls_map
+
+
+@torch.no_grad()
 def extract_register_patch_attention(
     qkv: Tensor,
     num_heads: int,
@@ -183,35 +254,20 @@ def extract_register_patch_attention(
     slot_renorm: bool = True,
     slot_exclude_cls: bool = True,
 ) -> Tensor:
-    """Compute register->patch attention weights for visualization / MBO masks.
-
-    Returns weights of shape [B, heads, R, P] (P = number of patch tokens),
-    using the same softmax convention the model was trained with:
-      * "standard": softmax over all keys, then read off the patch columns.
-      * "slot": competition softmax over the register dimension (registers vs
-        patches, optionally cls), optionally key-renormalized, then read off
-        patch columns.
-    """
-    B, N, _ = qkv.shape
-    C = qkv.shape[-1] // 3
-    qkv = qkv.reshape(B, N, 3, num_heads, C // num_heads)
-    q, k, _ = torch.unbind(qkv, 2)
-    q, k = q.transpose(1, 2), k.transpose(1, 2)
-    if rope is not None and apply_rope_fn is not None:
-        q, k = apply_rope_fn(q, k, rope)
-    R = n_storage_tokens
-    q_reg = q[:, :, 1 : 1 + R, :].float()
-    if attn_type == "slot":
-        k_nr = _split_register_keys(k, R, exclude_cls=slot_exclude_cls).float()  # [B,h,P or 1+P,d]
-        logits = torch.matmul(q_reg, k_nr.transpose(-2, -1)) * scale  # [B,h,R,P or 1+P]
-        attn = torch.softmax(logits, dim=-2)  # competition across registers
-        if slot_renorm:
-            attn = attn / (attn.sum(dim=-1, keepdim=True) + 1e-8)
-        return attn if slot_exclude_cls else attn[:, :, :, 1:]  # [B,h,R,P]
-    else:
-        logits = torch.matmul(q_reg, k.float().transpose(-2, -1)) * scale  # [B,h,R,N]
-        attn = torch.softmax(logits, dim=-1)  # over all keys
-        return attn[:, :, :, 1 + R :]  # patch columns -> [B,h,R,P]
+    """Compute register->patch attention weights for visualization / MBO masks."""
+    masks, _ = extract_register_attention_maps(
+        qkv,
+        num_heads=num_heads,
+        n_storage_tokens=n_storage_tokens,
+        scale=scale,
+        rope=rope,
+        apply_rope_fn=apply_rope_fn,
+        attn_type=attn_type,
+        slot_renorm=slot_renorm,
+        slot_exclude_cls=slot_exclude_cls,
+        direction="register_to_patch",
+    )
+    return masks
 
 
 class RegisterSlotAttention(SelfAttention):
