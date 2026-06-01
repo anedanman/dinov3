@@ -133,10 +133,11 @@ class DinoVisionTransformer(nn.Module):
         self.register_init = register_init
         self.register_gaussian_std_init = register_gaussian_std_init
         if self.n_storage_tokens > 0:
-            self.storage_tokens = nn.Parameter(torch.empty(1, n_storage_tokens, embed_dim, device=device))
+            n_storage_token_params = 1 if self.register_init == "gaussian" else n_storage_tokens
+            self.storage_tokens = nn.Parameter(torch.empty(1, n_storage_token_params, embed_dim, device=device))
             if self.register_init == "gaussian":
                 self.storage_tokens_log_sigma = nn.Parameter(
-                    torch.empty(1, n_storage_tokens, embed_dim, device=device)
+                    torch.empty(1, n_storage_token_params, embed_dim, device=device)
                 )
         logger.info(f"using base={pos_embed_rope_base} for rope new")
         logger.info(f"using min_period={pos_embed_rope_min_period} for rope new")
@@ -248,8 +249,8 @@ class DinoVisionTransformer(nn.Module):
             cls_token = self.cls_token + 0 * self.mask_token
         if self.n_storage_tokens > 0:
             if self.register_init == "gaussian":
-                mu = self.storage_tokens.expand(B, -1, -1)
-                sigma = self.storage_tokens_log_sigma.exp().expand(B, -1, -1)
+                mu = self.storage_tokens.expand(B, self.n_storage_tokens, -1)
+                sigma = self.storage_tokens_log_sigma.exp().expand(B, self.n_storage_tokens, -1)
                 eps = torch.randn(mu.shape, dtype=mu.dtype, device=mu.device)
                 storage_tokens = mu + eps * sigma
             else:

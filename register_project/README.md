@@ -122,8 +122,8 @@ Outputs (checkpoints, logs, `config.yaml`) land in `runs/<name>/`.
 **Model wiring** — `dinov3/models/vision_transformer.py`, `dinov3/models/__init__.py`
 - `register_attn_type` (`standard`|`slot`), `slot_mode`,
   `register_attn_exclude_cls`, and `register_init` flow from config.
-- `register_init="gaussian"` samples per-image register tokens from trainable
-  per-register mean/log-std parameters.
+- `register_init="gaussian"` samples per-image register tokens from shared
+  trainable mean/log-std parameters.
 - `DinoVisionTransformer.get_register_attention_maps(...)` returns either
   head-averaged `[B, R, H, W]` masks or per-head `[B, heads, R, H, W]` masks.
   `get_register_patch_attention(x, layer)` remains as the register→patch wrapper.

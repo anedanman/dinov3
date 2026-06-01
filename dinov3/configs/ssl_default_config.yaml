@@ -111,7 +111,7 @@ student:
   register_attn_type: standard  # "standard" or "slot" (slot-register competition attention)
   slot_mode: slot  # "slot" (key-renormalized weighted mean) or "literal" (out = A @ v); only used when register_attn_type=slot
   register_attn_exclude_cls: true  # For slot attention, registers compete over patches only by default.
-  register_init: learned  # "learned" fixed register params, or "gaussian" sampled from trainable mean/std params.
+  register_init: learned  # "learned" fixed register params, or "gaussian" sampled from shared trainable mean/std params.
   register_gaussian_std_init: 0.02
   mask_k_bias: false
   untie_cls_and_patch_norms: false  # If true, use separate norms for CLS/reg and patch/mask tokens
