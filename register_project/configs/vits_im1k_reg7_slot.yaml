@@ -41,8 +41,8 @@ student:
   register_attn_type: slot          # <-- slot-register competition attention
   slot_mode: slot                   # "slot" (key-renormalized weighted mean) or "literal"
   register_attn_exclude_cls: true   # registers compete over patch tokens only
-  register_init: learned            # "gaussian" samples registers from shared trainable mean/std
-  register_gaussian_std_init: 0.02
+  register_init: learned            # "gaussian" samples registers from shared Xavier-initialized mean/log-std
+  register_gaussian_std_init: 0.02  # legacy compatibility field; ignored by masked_ocl-style init
 
 # DINOv3 default crop resolution (256 global / 112 local).
 crops:

@@ -4,7 +4,6 @@
 # the terms of the DINOv3 License Agreement.
 
 import logging
-import math
 from functools import partial
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
@@ -231,9 +230,11 @@ class DinoVisionTransformer(nn.Module):
         self.rope_embed._init_weights()
         nn.init.normal_(self.cls_token, std=0.02)
         if self.n_storage_tokens > 0:
-            nn.init.normal_(self.storage_tokens, std=0.02)
             if self.register_init == "gaussian":
-                nn.init.constant_(self.storage_tokens_log_sigma, math.log(self.register_gaussian_std_init))
+                nn.init.xavier_uniform_(self.storage_tokens)
+                nn.init.xavier_uniform_(self.storage_tokens_log_sigma)
+            else:
+                nn.init.normal_(self.storage_tokens, std=0.02)
         nn.init.zeros_(self.mask_token)
         named_apply(init_weights_vit, self)
 
