@@ -565,6 +565,11 @@ def do_train(cfg, model, resume=False):
         model.train()
         _synchronize_cuda()
 
+    # Metric logging
+    logger.info("Starting training from iteration %d", start_iter)
+    metrics_file = os.path.join(cfg.train.output_dir, "training_metrics.json")
+    metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file)
+
     if resumed_from_checkpoint:
         # The checkpoint stores the state after iteration start_iter - 1.
         resume_step = max(start_iter - 1, 0)
@@ -582,11 +587,6 @@ def do_train(cfg, model, resume=False):
         model=model,
         start_iter=start_iter,
     )
-
-    # Metric logging
-    logger.info("Starting training from iteration %d", start_iter)
-    metrics_file = os.path.join(cfg.train.output_dir, "training_metrics.json")
-    metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file)
 
     # Manual garbage collection
     gc.disable()
