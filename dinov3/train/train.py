@@ -544,14 +544,37 @@ def do_train(cfg, model, resume=False):
         model.train()
         _synchronize_cuda()
 
+    def _run_simple_validation(step: int, reason: str):
+        simple_due = simple_evaluator.due(step)
+        if not simple_due.any:
+            return
+        logger.info(
+            "Running simple periodic eval at step %d (%s): knn=%s linear=%s coco_linear_seg=%s",
+            step,
+            reason,
+            simple_due.knn,
+            simple_due.linear,
+            simple_due.coco_seg,
+        )
+        _synchronize_cuda()
+        simple_evaluator.sync(model)  # collective (full_tensor); all ranks must call
+        simple_metrics = simple_evaluator.run(step, simple_due)
+        if distributed.is_main_process() and simple_metrics:
+            wandb_logger.log_scalars(wandb_run, simple_metrics, step=step)
+            metric_logger.update(**{k.replace("/", "_"): v for k, v in simple_metrics.items()})
+        model.train()
+        _synchronize_cuda()
+
     if resumed_from_checkpoint:
         # The checkpoint stores the state after iteration start_iter - 1.
+        resume_step = max(start_iter - 1, 0)
         _run_register_validation(
-            step=max(start_iter - 1, 0),
+            step=resume_step,
             run_viz=register_evaluator.viz_enabled,
             run_mbo=register_evaluator.mbo_enabled,
             reason="checkpoint resume",
         )
+        _run_simple_validation(step=resume_step, reason="checkpoint resume")
 
     # Build data loader
     data_loader = build_multi_resolution_data_loader_from_cfg(
@@ -715,23 +738,7 @@ def do_train(cfg, model, resume=False):
             _run_register_validation(iteration, run_viz, run_mbo, reason="scheduled")
 
         # Lightweight periodic KNN / linear / COCO linear segmentation probes.
-        simple_due = simple_evaluator.due(iteration)
-        if simple_due.any:
-            logger.info(
-                "Running simple periodic eval at step %d: knn=%s linear=%s coco_linear_seg=%s",
-                iteration,
-                simple_due.knn,
-                simple_due.linear,
-                simple_due.coco_seg,
-            )
-            _synchronize_cuda()
-            simple_evaluator.sync(model)  # collective (full_tensor); all ranks must call
-            simple_metrics = simple_evaluator.run(iteration, simple_due)
-            if distributed.is_main_process() and simple_metrics:
-                wandb_logger.log_scalars(wandb_run, simple_metrics, step=iteration)
-                metric_logger.update(**{k.replace("/", "_"): v for k, v in simple_metrics.items()})
-            model.train()
-            _synchronize_cuda()
+        _run_simple_validation(iteration, reason="scheduled")
 
         # Submit evaluation jobs
         if (
