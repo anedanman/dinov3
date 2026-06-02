@@ -218,6 +218,7 @@ evaluation:
       num_workers: 4
       k: 20
       temperature: 0.07
+      avg_register: true  # also run KNN on mean-pooled register-token features, when registers exist
       seed: 0
     linear:
       enabled: false

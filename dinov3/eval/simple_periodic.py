@@ -103,6 +103,40 @@ def _extract_cls_features(
     return torch.cat(features, dim=0), torch.cat(labels, dim=0)
 
 
+@torch.no_grad()
+def _extract_cls_and_avg_register_features(
+    backbone: nn.Module,
+    dataset: Dataset,
+    *,
+    batch_size: int,
+    num_workers: int,
+    device: str,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+    cls_features, avg_register_features, labels = [], [], []
+    has_register_features = True
+    backbone.eval()
+    for images, targets in loader:
+        images = images.to(device, non_blocking=True)
+        out = backbone(images, is_training=True)
+        cls_features.append(out["x_norm_clstoken"].float().cpu())
+        storage_tokens = out.get("x_storage_tokens", None)
+        if storage_tokens is None or storage_tokens.shape[1] == 0:
+            has_register_features = False
+        elif has_register_features:
+            avg_register_features.append(storage_tokens.float().mean(dim=1).cpu())
+        labels.append(torch.as_tensor(targets, dtype=torch.long).cpu())
+    avg_register = torch.cat(avg_register_features, dim=0) if has_register_features else None
+    return torch.cat(cls_features, dim=0), avg_register, torch.cat(labels, dim=0)
+
+
 def _accuracy(logits: torch.Tensor, labels: torch.Tensor, topk=(1, 5)) -> dict[str, float]:
     maxk = min(max(topk), logits.shape[1])
     pred = logits.topk(maxk, dim=1).indices
@@ -415,23 +449,61 @@ class SimplePeriodicEvaluator:
         return train_features, train_labels, val_features, val_labels, num_classes
 
     def _run_knn(self, backbone: nn.Module, pcfg: Any) -> dict[str, float]:
-        feats = self._classification_features(
-            backbone,
-            pcfg,
-            max_train=pcfg.get("max_train_images", 20000),
-            max_val=pcfg.get("max_val_images", 5000),
+        train_dataset_path = pcfg.get("train_dataset", None) or self.cfg.train.dataset_path
+        val_dataset_path = pcfg.get("val_dataset", None) or _default_val_dataset(train_dataset_path)
+        image_size = int(pcfg.get("image_size", self.cfg.crops.global_crops_size))
+        batch_size = int(pcfg.get("batch_size", 128))
+        num_workers = int(pcfg.get("num_workers", 4))
+        train_dataset = _make_classification_dataset(
+            train_dataset_path,
+            image_size,
+            pcfg.get("max_train_images", 20000),
+            int(pcfg.get("seed", 0)),
         )
-        train_features, train_labels, val_features, val_labels, num_classes = feats
-        return _run_knn_probe(
-            train_features,
+        val_dataset = _make_classification_dataset(
+            val_dataset_path,
+            image_size,
+            pcfg.get("max_val_images", 5000),
+            int(pcfg.get("seed", 0)) + 1,
+        )
+        train_cls, train_avg_register, train_labels = _extract_cls_and_avg_register_features(
+            backbone,
+            train_dataset,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            device=self.device,
+        )
+        val_cls, val_avg_register, val_labels = _extract_cls_and_avg_register_features(
+            backbone,
+            val_dataset,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            device=self.device,
+        )
+        num_classes = int(torch.maximum(train_labels.max(), val_labels.max()).item()) + 1
+        metrics = _run_knn_probe(
+            train_cls,
             train_labels,
-            val_features,
+            val_cls,
             val_labels,
             k=int(pcfg.get("k", 20)),
             temperature=float(pcfg.get("temperature", 0.07)),
             num_classes=num_classes,
             device=self.device,
         )
+        if bool(pcfg.get("avg_register", True)) and train_avg_register is not None and val_avg_register is not None:
+            avg_register_metrics = _run_knn_probe(
+                train_avg_register,
+                train_labels,
+                val_avg_register,
+                val_labels,
+                k=int(pcfg.get("k", 20)),
+                temperature=float(pcfg.get("temperature", 0.07)),
+                num_classes=num_classes,
+                device=self.device,
+            )
+            metrics.update({f"avg_register_{k}": v for k, v in avg_register_metrics.items()})
+        return metrics
 
     def _run_linear(self, backbone: nn.Module, pcfg: Any) -> dict[str, float]:
         feats = self._classification_features(
