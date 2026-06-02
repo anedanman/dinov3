@@ -16,12 +16,14 @@ MODEL:
 
 train:
   # Effective batch 512 = 128 micro-batch x 4 grad-accum steps (single 95GB GPU, 31GB host RAM).
+  # Keep the micro-batch conservative because the hosts are RAM-constrained.
   batch_size_per_gpu: 128
   grad_accum_steps: 4
   dataset_path: ImageNetPacked:split=TRAIN:root=~/datasets/imagenet1k_packed
   num_workers: 8
-  pin_memory: false
-  prefetch_factor: 1
+  pin_memory: true
+  prefetch_factor: 2
+  persistent_workers: true
   dataloader_multiprocessing_context: forkserver
   compile: true
   OFFICIAL_EPOCH_LENGTH: 1          # overwritten by the step-based schedule normalizer

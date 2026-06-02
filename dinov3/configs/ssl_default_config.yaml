@@ -72,6 +72,7 @@ train:
   num_workers: 10
   pin_memory: true
   prefetch_factor: null
+  persistent_workers: false
   dataloader_multiprocessing_context: null
   OFFICIAL_EPOCH_LENGTH: 1250
   monitor_gradient_norm: false

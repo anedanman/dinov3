@@ -235,7 +235,7 @@ def make_data_loader(
     logger.info(
         "using PyTorch data loader "
         f"(pin_memory={pin_memory}, prefetch_factor={prefetch_factor}, "
-        f"multiprocessing_context={multiprocessing_context})"
+        f"persistent_workers={persistent_workers}, multiprocessing_context={multiprocessing_context})"
     )
     loader_kwargs = dict(
         sampler=sampler,

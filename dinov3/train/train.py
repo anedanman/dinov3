@@ -383,6 +383,7 @@ def build_data_loader_from_cfg(
         sampler_advance=start_iter * dataloader_batch_size_per_gpu * grad_accum,
         drop_last=True,
         collate_fn=collate_fn,
+        persistent_workers=cfg.train.get("persistent_workers", False),
         pin_memory=cfg.train.get("pin_memory", True),
         prefetch_factor=cfg.train.get("prefetch_factor", None),
         multiprocessing_context=cfg.train.get("dataloader_multiprocessing_context", None),
