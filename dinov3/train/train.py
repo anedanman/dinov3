@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import sys
+import time
 from functools import partial
 from pathlib import Path
 
@@ -489,20 +490,6 @@ def do_train(cfg, model, resume=False):
             f"{distributed.get_world_size()} x accum {grad_accum})"
         )
 
-    def _grouped(loader, k):
-        """Yield lists of `k` consecutive micro-batches (one optimizer step)."""
-        it = iter(loader)
-        while True:
-            group = []
-            try:
-                for _ in range(k):
-                    group.append(next(it))
-            except StopIteration:
-                if group:
-                    yield group
-                return
-            yield group
-
     # Weights & Biases + register-token evaluator (viz + COCO MBO)
     wandb_run = wandb_logger.init_wandb(cfg)
     wandb_log_freq = cfg.train.get("wandb", {}).get("log_freq", 10) if cfg.train.get("wandb", None) else 10
@@ -609,8 +596,9 @@ def do_train(cfg, model, resume=False):
         num_gram_updates = math.ceil((start_iter + 1 - cfg.gram.it_first_update) / cfg.gram.update_frequency)
         logger.info(f"Gram was updated {num_gram_updates} times before iteration {start_iter}")
     consecutive_nan_count = 0
-    for data_group in metric_logger.log_every(
-        _grouped(data_loader, grad_accum),
+    data_iter = iter(data_loader)
+    for _ in metric_logger.log_every(
+        range(start_iter, max_iter),
         print_freq=10,
         header="Training",
         n_iterations=max_iter,
@@ -642,7 +630,18 @@ def do_train(cfg, model, resume=False):
         total_loss = None
         accum_metrics = {}
         loss_scale = 1.0 / grad_accum
-        for micro in data_group:
+        num_micro_batches = 0
+        data_fetch_time = 0.0
+        for _ in range(grad_accum):
+            fetch_start = time.time()
+            try:
+                micro = next(data_iter)
+            except StopIteration:
+                data_iter = iter(data_loader)
+                micro = next(data_iter)
+            data_fetch_time += time.time() - fetch_start
+            num_micro_batches += 1
+
             micro["global_batch_size"] = global_batch_size
             micro_loss, micro_metrics = model.forward_backward(
                 micro, teacher_temp=teacher_temp, iteration=it, loss_scale=loss_scale
@@ -655,8 +654,8 @@ def do_train(cfg, model, resume=False):
                 )
                 accum_metrics[k] = vt if k not in accum_metrics else accum_metrics[k] + vt
         # Average reported loss / metrics over the accumulated micro-batches.
-        total_loss = total_loss / len(data_group)
-        metrics_dict = {k: v / len(data_group) for k, v in accum_metrics.items()}
+        total_loss = total_loss / num_micro_batches
+        metrics_dict = {k: v / num_micro_batches for k, v in accum_metrics.items()}
 
         # Gradient clipping
         if cfg.optim.clip_grad:
@@ -722,6 +721,7 @@ def do_train(cfg, model, resume=False):
         metric_logger.update(wd=wd)
         metric_logger.update(mom=mom)
         metric_logger.update(last_layer_lr=last_layer_lr)
+        metric_logger.update(data_fetch_time=data_fetch_time)
         metric_logger.update(total_loss=total_loss, **metrics_dict)
 
         # Weights & Biases scalar logging
