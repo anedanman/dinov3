@@ -61,6 +61,27 @@ optim:
 
 evaluation:
   eval_period_iterations: 0
+  simple:
+    enabled: true
+    knn:
+      enabled: true
+      period_steps: 10000
+      train_dataset: ImageNetPacked:split=TRAIN:root=~/datasets/imagenet1k_packed
+      val_dataset: ImageNetPacked:split=VAL:root=~/datasets/imagenet1k_packed
+      image_size: 256
+    linear:
+      enabled: true
+      period_steps: 50000
+      train_dataset: ImageNetPacked:split=TRAIN:root=~/datasets/imagenet1k_packed
+      val_dataset: ImageNetPacked:split=VAL:root=~/datasets/imagenet1k_packed
+      image_size: 256
+    coco_linear_segmentation:
+      enabled: true
+      period_steps: 50000
+      coco_root: ~/datasets/coco
+      train_split: train2017
+      val_split: val2017
+      image_size: 256
 
 checkpointing:
   period: 5000

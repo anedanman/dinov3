@@ -42,6 +42,7 @@ from dinov3.train.multidist_meta_arch import MultiDistillationMetaArch
 from dinov3.train.ssl_meta_arch import SSLMetaArch
 from dinov3.train.step_schedule import normalize_step_schedule
 from dinov3.eval.register_tokens.evaluator import RegisterEvaluator
+from dinov3.eval.simple_periodic import SimplePeriodicEvaluator
 
 assert torch.__version__ >= (2, 1)
 torch.backends.cuda.matmul.allow_tf32 = True  # pytorch 1.12 sets this to false by default
@@ -505,6 +506,7 @@ def do_train(cfg, model, resume=False):
     wandb_run = wandb_logger.init_wandb(cfg)
     wandb_log_freq = cfg.train.get("wandb", {}).get("log_freq", 10) if cfg.train.get("wandb", None) else 10
     register_evaluator = RegisterEvaluator(cfg)
+    simple_evaluator = SimplePeriodicEvaluator(cfg)
 
     def _synchronize_cuda():
         if torch.cuda.is_available():
@@ -711,6 +713,25 @@ def do_train(cfg, model, resume=False):
         run_mbo = register_evaluator.should_run_mbo(iteration)
         if run_viz or run_mbo:
             _run_register_validation(iteration, run_viz, run_mbo, reason="scheduled")
+
+        # Lightweight periodic KNN / linear / COCO linear segmentation probes.
+        simple_due = simple_evaluator.due(iteration)
+        if simple_due.any:
+            logger.info(
+                "Running simple periodic eval at step %d: knn=%s linear=%s coco_linear_seg=%s",
+                iteration,
+                simple_due.knn,
+                simple_due.linear,
+                simple_due.coco_seg,
+            )
+            _synchronize_cuda()
+            simple_evaluator.sync(model)  # collective (full_tensor); all ranks must call
+            simple_metrics = simple_evaluator.run(iteration, simple_due)
+            if distributed.is_main_process() and simple_metrics:
+                wandb_logger.log_scalars(wandb_run, simple_metrics, step=iteration)
+                metric_logger.update(**{k.replace("/", "_"): v for k, v in simple_metrics.items()})
+            model.train()
+            _synchronize_cuda()
 
         # Submit evaluation jobs
         if (
