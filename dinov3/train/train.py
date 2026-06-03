@@ -533,14 +533,15 @@ def do_train(cfg, model, resume=False):
         _synchronize_cuda()
 
     def _run_simple_validation(step: int, reason: str):
-        simple_due = simple_evaluator.due(step)
+        simple_due = simple_evaluator.due(step, final_step=max_iter - 1)
         if not simple_due.any:
             return
         logger.info(
-            "Running simple periodic eval at step %d (%s): knn=%s linear=%s coco_linear_seg=%s",
+            "Running simple periodic eval at step %d (%s): knn=%s knn_full=%s linear=%s coco_linear_seg=%s",
             step,
             reason,
             simple_due.knn,
+            simple_due.knn_full,
             simple_due.linear,
             simple_due.coco_seg,
         )

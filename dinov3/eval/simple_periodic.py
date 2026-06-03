@@ -365,12 +365,13 @@ def _run_coco_linear_segmentation(
 @dataclass
 class _Due:
     knn: bool
+    knn_full: bool
     linear: bool
     coco_seg: bool
 
     @property
     def any(self) -> bool:
-        return self.knn or self.linear or self.coco_seg
+        return self.knn or self.knn_full or self.linear or self.coco_seg
 
 
 class SimplePeriodicEvaluator:
@@ -386,9 +387,9 @@ class SimplePeriodicEvaluator:
             self._eval_backbone = build_eval_backbone(self.cfg, device=self.device)
         return self._eval_backbone
 
-    def due(self, step: int) -> _Due:
+    def due(self, step: int, *, final_step: int | None = None) -> _Due:
         if not self.enabled:
-            return _Due(False, False, False)
+            return _Due(False, False, False, False)
         ecfg = self.cfg.evaluation.simple
 
         def is_due(section: str) -> bool:
@@ -396,8 +397,16 @@ class SimplePeriodicEvaluator:
             period = int(pcfg.get("period_steps", 0))
             return bool(pcfg.get("enabled", False)) and period > 0 and (step + 1) % period == 0
 
+        knn_cfg = ecfg.get("knn", {})
+        knn_full = (
+            bool(knn_cfg.get("enabled", False))
+            and bool(knn_cfg.get("full_at_end", False))
+            and final_step is not None
+            and step == int(final_step)
+        )
         return _Due(
-            knn=is_due("knn"),
+            knn=is_due("knn") and not knn_full,
+            knn_full=knn_full,
             linear=is_due("linear"),
             coco_seg=is_due("coco_linear_segmentation"),
         )
@@ -417,6 +426,11 @@ class SimplePeriodicEvaluator:
                 metrics.update({f"eval_knn/{k}": v for k, v in self._run_knn(backbone, ecfg.knn).items()})
             except Exception as exc:
                 logger.warning("Simple KNN eval failed at step %d: %s", step, exc)
+        if due.knn_full:
+            try:
+                metrics.update({f"eval_knn_full/{k}": v for k, v in self._run_knn(backbone, ecfg.knn, full=True).items()})
+            except Exception as exc:
+                logger.warning("Full KNN eval failed at step %d: %s", step, exc)
         if due.linear:
             try:
                 metrics.update({f"eval_linear/{k}": v for k, v in self._run_linear(backbone, ecfg.linear).items()})
@@ -448,22 +462,27 @@ class SimplePeriodicEvaluator:
         num_classes = int(torch.maximum(train_labels.max(), val_labels.max()).item()) + 1
         return train_features, train_labels, val_features, val_labels, num_classes
 
-    def _run_knn(self, backbone: nn.Module, pcfg: Any) -> dict[str, float]:
+    def _run_knn(self, backbone: nn.Module, pcfg: Any, *, full: bool = False) -> dict[str, float]:
         train_dataset_path = pcfg.get("train_dataset", None) or self.cfg.train.dataset_path
         val_dataset_path = pcfg.get("val_dataset", None) or _default_val_dataset(train_dataset_path)
         image_size = int(pcfg.get("image_size", self.cfg.crops.global_crops_size))
         batch_size = int(pcfg.get("batch_size", 128))
         num_workers = int(pcfg.get("num_workers", 4))
+        max_train_images = None if full else pcfg.get("max_train_images", 20000)
+        max_val_images = None if full else pcfg.get("max_val_images", 5000)
+        if full:
+            max_train_images = pcfg.get("full_max_train_images", None)
+            max_val_images = pcfg.get("full_max_val_images", None)
         train_dataset = _make_classification_dataset(
             train_dataset_path,
             image_size,
-            pcfg.get("max_train_images", 20000),
+            max_train_images,
             int(pcfg.get("seed", 0)),
         )
         val_dataset = _make_classification_dataset(
             val_dataset_path,
             image_size,
-            pcfg.get("max_val_images", 5000),
+            max_val_images,
             int(pcfg.get("seed", 0)) + 1,
         )
         train_cls, train_avg_register, train_labels = _extract_cls_and_avg_register_features(

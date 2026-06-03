@@ -71,6 +71,9 @@ evaluation:
       train_dataset: ImageNetPacked:split=TRAIN:root=~/datasets/imagenet1k_packed
       val_dataset: ImageNetPacked:split=VAL:root=~/datasets/imagenet1k_packed
       image_size: 256
+      full_at_end: true
+      full_max_train_images: null
+      full_max_val_images: null
     linear:
       enabled: true
       period_steps: 50000
