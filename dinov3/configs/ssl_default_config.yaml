@@ -212,8 +212,8 @@ evaluation:
       train_dataset: null  # null = train.dataset_path
       val_dataset: null  # null = train dataset with split=VAL
       image_size: 256
-      max_train_images: 20000
-      max_val_images: 5000
+      max_train_images: 40000
+      max_val_images: 10000
       full_at_end: false
       full_max_train_images: null  # null = full train split
       full_max_val_images: null  # null = full val split
