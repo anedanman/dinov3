@@ -7,6 +7,7 @@
 
 import logging
 import os
+import math
 
 from omegaconf import OmegaConf
 
@@ -55,12 +56,23 @@ def log_images(run, panels, step: int, key: str = "register_attention", caption=
     if run is None or not panels:
         return
     import numpy as np
+    from PIL import Image
     import wandb
 
     grid = np.concatenate(panels, axis=0)  # stack panels vertically -> single image
+    max_pixels = int(os.environ.get("DINOV3_WANDB_MAX_IMAGE_PIXELS", "4000000"))
+    image = Image.fromarray(grid)
+    if max_pixels > 0 and grid.shape[0] * grid.shape[1] > max_pixels:
+        scale = math.sqrt(max_pixels / float(grid.shape[0] * grid.shape[1]))
+        resampling = getattr(Image, "Resampling", Image).BILINEAR
+        image = image.resize(
+            (max(1, int(grid.shape[1] * scale)), max(1, int(grid.shape[0] * scale))),
+            resampling,
+        )
     if caption is None:
         caption = f"{len(panels)} images"
-    run.log({key: wandb.Image(grid, caption=caption)}, step=step)
+    run.log({key: wandb.Image(image, caption=caption)}, step=step)
+    image.close()
 
 
 def finish(run):

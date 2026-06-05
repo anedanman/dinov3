@@ -42,6 +42,7 @@ from dinov3.train.cosine_lr_scheduler import CosineScheduler, linear_warmup_cosi
 from dinov3.train.multidist_meta_arch import MultiDistillationMetaArch
 from dinov3.train.ssl_meta_arch import SSLMetaArch
 from dinov3.train.step_schedule import normalize_step_schedule
+from dinov3.utils.memory import release_memory
 from dinov3.eval.register_tokens.evaluator import RegisterEvaluator
 from dinov3.eval.simple_periodic import SimplePeriodicEvaluator
 
@@ -500,6 +501,10 @@ def do_train(cfg, model, resume=False):
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
+    def _release_eval_memory(reason: str):
+        release_memory(empty_cuda_cache=bool(cfg.train.get("empty_cuda_cache_after_eval", False)))
+        logger.info("Released temporary memory after %s", reason)
+
     def _run_register_validation(step: int, run_viz: bool, run_mbo: bool, reason: str):
         if not (run_viz or run_mbo):
             return
@@ -511,26 +516,37 @@ def do_train(cfg, model, resume=False):
             run_mbo,
         )
         _synchronize_cuda()
-        register_evaluator.sync(model)  # collective (full_tensor); all ranks must call
-        if distributed.is_main_process():
-            if run_viz:
-                try:
-                    viz_outputs = register_evaluator.run_viz()
-                    if isinstance(viz_outputs, dict):
-                        for key, panels in viz_outputs.items():
-                            wandb_logger.log_images(wandb_run, panels, step=step, key=key)
-                    else:
-                        wandb_logger.log_images(wandb_run, viz_outputs, step=step, key="register_attention")
-                except Exception as e:
-                    logger.warning(f"register viz failed: {e}")
-            if run_mbo:
-                try:
-                    mbo_metrics = register_evaluator.run_mbo()
-                    wandb_logger.log_scalars(wandb_run, _format_mbo_metrics_for_wandb(mbo_metrics), step=step)
-                except Exception as e:
-                    logger.warning(f"MBO eval failed: {e}")
-        model.train()
-        _synchronize_cuda()
+        try:
+            register_evaluator.sync(model)  # collective (full_tensor); all ranks must call
+            if distributed.is_main_process():
+                if run_viz:
+                    viz_outputs = None
+                    try:
+                        viz_outputs = register_evaluator.run_viz()
+                        if isinstance(viz_outputs, dict):
+                            for key, panels in viz_outputs.items():
+                                wandb_logger.log_images(wandb_run, panels, step=step, key=key)
+                        else:
+                            wandb_logger.log_images(wandb_run, viz_outputs, step=step, key="register_attention")
+                    except Exception as e:
+                        logger.warning(f"register viz failed: {e}")
+                    finally:
+                        if isinstance(viz_outputs, dict):
+                            viz_outputs.clear()
+                        del viz_outputs
+                if run_mbo:
+                    mbo_metrics = None
+                    try:
+                        mbo_metrics = register_evaluator.run_mbo()
+                        wandb_logger.log_scalars(wandb_run, _format_mbo_metrics_for_wandb(mbo_metrics), step=step)
+                    except Exception as e:
+                        logger.warning(f"MBO eval failed: {e}")
+                    finally:
+                        del mbo_metrics
+        finally:
+            model.train()
+            _synchronize_cuda()
+            _release_eval_memory("register validation")
 
     def _run_simple_validation(step: int, reason: str):
         simple_due = simple_evaluator.due(step, final_step=max_iter - 1)
@@ -546,13 +562,18 @@ def do_train(cfg, model, resume=False):
             simple_due.coco_seg,
         )
         _synchronize_cuda()
-        simple_evaluator.sync(model)  # collective (full_tensor); all ranks must call
-        simple_metrics = simple_evaluator.run(step, simple_due)
-        if distributed.is_main_process() and simple_metrics:
-            wandb_logger.log_scalars(wandb_run, simple_metrics, step=step)
-            metric_logger.update(**{k.replace("/", "_"): v for k, v in simple_metrics.items()})
-        model.train()
-        _synchronize_cuda()
+        simple_metrics = None
+        try:
+            simple_evaluator.sync(model)  # collective (full_tensor); all ranks must call
+            simple_metrics = simple_evaluator.run(step, simple_due)
+            if distributed.is_main_process() and simple_metrics:
+                wandb_logger.log_scalars(wandb_run, simple_metrics, step=step)
+                metric_logger.update(**{k.replace("/", "_"): v for k, v in simple_metrics.items()})
+        finally:
+            del simple_metrics
+            model.train()
+            _synchronize_cuda()
+            _release_eval_memory("simple periodic eval")
 
     # Metric logging
     logger.info("Starting training from iteration %d", start_iter)
@@ -579,7 +600,7 @@ def do_train(cfg, model, resume=False):
 
     # Manual garbage collection
     gc.disable()
-    gc.collect()
+    release_memory()
 
     # Training loop
     student = model.student
@@ -612,7 +633,7 @@ def do_train(cfg, model, resume=False):
         # Garbage collection (trigger manually so it happens on all ranks at the same time)
         if (iteration + 1) % 150 == 0:
             logger.info("Garbage collection")
-            gc.collect()
+            release_memory()
 
         if cfg.gram.use_loss and model.gram_it_load_ema_teacher == it:
             logger.info(f"Loading EMA teacher into Gram teacher before iteration {it}")

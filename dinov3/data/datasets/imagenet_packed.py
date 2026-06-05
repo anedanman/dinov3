@@ -92,12 +92,14 @@ class ImageNetPacked(ExtendedVisionDataset):
                 f"Build it with tools/build_packed_imagenet.py "
                 f"(expected {self._blob_path} and {self._index_path})."
             )
-        # Index is small; load eagerly. The blob is read with positional reads
+        # The index is mmap'd by default so forkserver/spawn workers do not each
+        # own a private copy. The blob is read with positional reads
         # (os.pread) rather than mmap'd: mapping the whole multi-hundred-GB blob
         # leaves every touched page resident per worker, so host RAM creeps up
         # over a run. pread copies exactly the requested bytes; we also advise the
         # kernel to drop those pages because random SSL sampling has little reuse.
-        self._index = np.load(self._index_path)
+        mmap_index = os.environ.get("DINOV3_PACKED_MMAP_INDEX", "1").lower() not in {"0", "false", "no"}
+        self._index = np.load(self._index_path, mmap_mode="r" if mmap_index else None)
         self._fd = None  # opened lazily so the descriptor is created per DataLoader worker
         self._drop_cache = os.environ.get("DINOV3_PACKED_DROP_CACHE", "1").lower() not in {"0", "false", "no"}
         self._page_size = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
@@ -140,7 +142,8 @@ class ImageNetPacked(ExtendedVisionDataset):
         if not (hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED")):
             return
         page_offset = offset - (offset % self._page_size)
-        page_length = offset + length - page_offset
+        page_end = ((offset + length + self._page_size - 1) // self._page_size) * self._page_size
+        page_length = page_end - page_offset
         try:
             os.posix_fadvise(fd, page_offset, page_length, os.POSIX_FADV_DONTNEED)
         except OSError:

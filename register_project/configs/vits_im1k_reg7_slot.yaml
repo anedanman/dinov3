@@ -20,7 +20,7 @@ train:
   batch_size_per_gpu: 128
   grad_accum_steps: 4
   dataset_path: ImageNetPacked:split=TRAIN:root=~/datasets/imagenet1k_packed
-  num_workers: 8
+  num_workers: 16
   pin_memory: true
   prefetch_factor: 2
   persistent_workers: true
@@ -96,6 +96,7 @@ register_viz:
   enabled: true
   every_n_steps: 2500
   num_images: 8
+  coco_num_images: 2
   layer: -1
   dataset: ImageNetPacked:split=VAL:root=~/datasets/imagenet1k_packed
   image_size: 256
