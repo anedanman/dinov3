@@ -51,8 +51,11 @@ def _get_pinned_memory_mb():
     if not torch.cuda.is_available():
         return None
     try:
+        # "allocated_bytes.current" counts bytes held from the OS, including
+        # freed-but-cached blocks (the host allocator has no separate
+        # "reserved" stat).
         stats = torch.cuda.host_memory_stats()
-        return stats["reserved_bytes.all.current"] / (1024.0 * 1024.0)
+        return stats["allocated_bytes.current"] / (1024.0 * 1024.0)
     except (AttributeError, KeyError, RuntimeError):
         return None
 
