@@ -90,7 +90,7 @@ def _extract_cls_features(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=False,  # avoid growing the never-freed pinned-host cache for occasional evals
         drop_last=False,
     )
     features, labels = [], []
@@ -117,7 +117,7 @@ def _extract_cls_and_avg_register_features(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=False,  # avoid growing the never-freed pinned-host cache for occasional evals
         drop_last=False,
     )
     cls_features, avg_register_features, labels = [], [], []
@@ -312,7 +312,7 @@ def _run_coco_linear_segmentation(
         batch_size=int(scfg.batch_size),
         shuffle=True,
         num_workers=int(scfg.num_workers),
-        pin_memory=True,
+        pin_memory=False,  # avoid growing the never-freed pinned-host cache for occasional evals
         drop_last=False,
     )
     val_loader = DataLoader(
@@ -320,7 +320,7 @@ def _run_coco_linear_segmentation(
         batch_size=int(scfg.batch_size),
         shuffle=False,
         num_workers=int(scfg.num_workers),
-        pin_memory=True,
+        pin_memory=False,  # avoid growing the never-freed pinned-host cache for occasional evals
         drop_last=False,
     )
     head = None

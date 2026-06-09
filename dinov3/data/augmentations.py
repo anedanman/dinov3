@@ -32,6 +32,7 @@ class DataAugmentationDINO(object):
         horizontal_flips=True,
         mean=IMAGENET_DEFAULT_MEAN,
         std=IMAGENET_DEFAULT_STD,
+        normalize_in_loader=True,
     ):
         self.global_crops_scale = global_crops_scale
         self.local_crops_scale = local_crops_scale
@@ -61,6 +62,7 @@ class DataAugmentationDINO(object):
         logger.info(f"patch_size if local_crops_subset_of_global_crops: {patch_size}")
         logger.info(f"share_color_jitter: {share_color_jitter}")
         logger.info(f"horizontal flips: {horizontal_flips}")
+        logger.info(f"normalize_in_loader: {normalize_in_loader}")
         logger.info("###################################")
 
         # Global crops and gram teacher crops can have different sizes. We first take a crop of the maximum size
@@ -140,14 +142,19 @@ class DataAugmentationDINO(object):
 
         local_transfo_extra = GaussianBlur(p=0.5)
 
-        # normalization
-        self.normalize = v2.Compose(
-            [
-                v2.ToImage(),
-                v2.ToDtype(torch.float32, scale=True),
-                make_normalize_transform(mean=mean, std=std),
-            ]
-        )
+        # normalization; with normalize_in_loader=False the crops stay uint8 and
+        # scaling + mean/std normalization happen on the GPU (see SSLMetaArch).
+        # This shrinks worker CPU time and cuts inter-process batch traffic 4x.
+        if normalize_in_loader:
+            self.normalize = v2.Compose(
+                [
+                    v2.ToImage(),
+                    v2.ToDtype(torch.float32, scale=True),
+                    make_normalize_transform(mean=mean, std=std),
+                ]
+            )
+        else:
+            self.normalize = v2.Compose([v2.ToImage(), v2.ToDtype(torch.uint8)])
 
         if self.share_color_jitter:
             self.color_jittering = color_jittering

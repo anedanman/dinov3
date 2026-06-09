@@ -49,6 +49,7 @@ def _vit_kwargs_from_cfg(cfg):
         register_attn_type=s.get("register_attn_type", "standard"),
         slot_mode=s.get("slot_mode", "slot"),
         register_attn_exclude_cls=s.get("register_attn_exclude_cls", True),
+        patch_cls_attn_type=s.get("patch_cls_attn_type", "standard"),
         register_init=s.get("register_init", "learned"),
         register_gaussian_std_init=s.get("register_gaussian_std_init", 0.02),
     )

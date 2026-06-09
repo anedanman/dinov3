@@ -6,6 +6,7 @@
 from .attention import (
     CausalSelfAttention,
     LinearKMaskedBias,
+    PatchClsSeparateRegisterBudgetAttention,
     RegisterSlotAttention,
     SelfAttention,
     extract_register_attention_maps,

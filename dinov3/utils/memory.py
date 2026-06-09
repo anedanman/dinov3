@@ -42,17 +42,30 @@ def malloc_trim() -> bool:
     return bool(_MALLOC_TRIM(0))
 
 
-def release_memory(*, empty_cuda_cache: bool = False) -> None:
-    """Collect Python cycles, trim glibc arenas, and optionally clear CUDA cache."""
+def release_memory(*, empty_cuda_cache: bool = False, empty_pinned_cache: bool = False) -> None:
+    """Collect Python cycles, trim glibc arenas, and optionally clear CUDA caches.
+
+    ``empty_pinned_cache`` releases unused blocks from the CUDA caching *host*
+    allocator. Pinned blocks are never returned to the OS otherwise, so the
+    pin_memory cache only ever grows (it fragments with varying batch shapes
+    and eval loaders); on RAM-constrained hosts that growth looks like a leak.
+    """
     gc.collect()
     malloc_trim()
+    if not (empty_cuda_cache or empty_pinned_cache):
+        return
+    try:
+        import torch
+    except ImportError:
+        return
+    if not torch.cuda.is_available():
+        return
+    if empty_pinned_cache:
+        host_empty_cache = getattr(torch._C, "_host_emptyCache", None)
+        if host_empty_cache is not None:
+            host_empty_cache()
     if empty_cuda_cache:
-        try:
-            import torch
-        except ImportError:
-            return
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
 
 
 class PeriodicMemoryTrimmer:

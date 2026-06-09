@@ -46,6 +46,17 @@ def _get_host_memory_mb():
     return rss / (1024.0 * 1024.0), available / (1024.0 * 1024.0)
 
 
+def _get_pinned_memory_mb():
+    """Current CUDA pinned-host-allocator reservation in MiB (or None)."""
+    if not torch.cuda.is_available():
+        return None
+    try:
+        stats = torch.cuda.host_memory_stats()
+        return stats["reserved_bytes.all.current"] / (1024.0 * 1024.0)
+    except (AttributeError, KeyError, RuntimeError):
+        return None
+
+
 class MetricLogger(object):
     def __init__(self, delimiter="\t", output_file=None):
         self.meters = defaultdict(SmoothedValue)
@@ -119,6 +130,7 @@ class MetricLogger(object):
             log_list += ["(max mem: {max_memory:.0f})"]
         log_list += ["host rss: {host_rss:.0f}"]
         log_list += ["host avail: {host_available:.0f}"]
+        log_list += ["pinned: {pinned:.0f}"]
 
         log_msg = self.delimiter.join(log_list)
         MB = 1024.0 * 1024.0
@@ -145,6 +157,8 @@ class MetricLogger(object):
                         "host_rss": float("nan"),
                         "host_available": float("nan"),
                     }
+                pinned_memory = _get_pinned_memory_mb()
+                host_kwargs["pinned"] = pinned_memory if pinned_memory is not None else float("nan")
                 if torch.cuda.is_available():
                     logger.info(
                         log_msg.format(

@@ -14,6 +14,7 @@ from torch import Tensor, nn
 from dinov3.layers import (
     LayerScale,
     Mlp,
+    PatchClsSeparateRegisterBudgetAttention,
     PatchEmbed,
     RegisterSlotAttention,
     RMSNorm,
@@ -100,6 +101,7 @@ class DinoVisionTransformer(nn.Module):
         register_attn_type: str = "standard",
         slot_mode: str = "slot",
         register_attn_exclude_cls: bool = True,
+        patch_cls_attn_type: str = "standard",
         register_init: str = "learned",
         register_gaussian_std_init: float = 0.02,
         device: Any | None = None,
@@ -165,20 +167,36 @@ class DinoVisionTransformer(nn.Module):
 
         # Register-token attention behaviour.
         assert register_attn_type in ("standard", "slot"), f"unknown register_attn_type={register_attn_type}"
+        assert patch_cls_attn_type in ("standard", "separate_register_budget"), (
+            f"unknown patch_cls_attn_type={patch_cls_attn_type}"
+        )
         self.register_attn_type = register_attn_type
         self.slot_mode = slot_mode
         self.register_attn_exclude_cls = register_attn_exclude_cls
+        self.patch_cls_attn_type = patch_cls_attn_type
         if register_attn_type == "slot":
             assert n_storage_tokens > 0, "register_attn_type='slot' requires n_storage_tokens > 0"
             logger.info(
                 "using SLOT register attention "
-                f"(mode={slot_mode}, exclude_cls={register_attn_exclude_cls}) with {n_storage_tokens} registers"
+                f"(mode={slot_mode}, exclude_cls={register_attn_exclude_cls}, "
+                f"patch_cls_attn_type={patch_cls_attn_type}) with {n_storage_tokens} registers"
             )
             attn_class = partial(
                 RegisterSlotAttention,
                 n_storage_tokens=n_storage_tokens,
                 slot_mode=slot_mode,
                 exclude_cls=register_attn_exclude_cls,
+                patch_cls_attn_type=patch_cls_attn_type,
+            )
+        elif patch_cls_attn_type == "separate_register_budget":
+            assert n_storage_tokens > 0, "patch_cls_attn_type='separate_register_budget' requires n_storage_tokens > 0"
+            logger.info(
+                "using separate register attention budget for CLS/patch rows "
+                f"with {n_storage_tokens} registers"
+            )
+            attn_class = partial(
+                PatchClsSeparateRegisterBudgetAttention,
+                n_storage_tokens=n_storage_tokens,
             )
         else:
             attn_class = SelfAttention
@@ -427,6 +445,7 @@ class DinoVisionTransformer(nn.Module):
                         attn_type=self.register_attn_type,
                         slot_renorm=(self.slot_mode == "slot"),
                         slot_exclude_cls=self.register_attn_exclude_cls,
+                        patch_cls_attn_type=self.patch_cls_attn_type,
                         direction=direction,
                     )
                     masks_by_direction[direction].append(masks)

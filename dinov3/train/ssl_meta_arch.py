@@ -138,6 +138,10 @@ class SSLMetaArch(nn.Module):
         self.model_ema.requires_grad_(False)
         self.ema_params_lists = None
 
+        # Lazily-created GPU normalization constants for uint8 crops (`train.normalize_on_gpu`).
+        self._gpu_normalize_scale = None
+        self._gpu_normalize_shift = None
+
         # getting config params fixed:
         self.n_local_crops = self.cfg.crops.local_crops_number
         self.is_distillation_enabled = self.cfg.distillation.enabled
@@ -352,6 +356,32 @@ class SSLMetaArch(nn.Module):
                 self.teacher.ibot_head.init_weights()
             logger.info(f"Performing distillation from: {self.teacher}")
 
+    def _maybe_gpu_normalize(self, crops: Tensor) -> Tensor:
+        """Scale + mean/std-normalize uint8 crops on the GPU.
+
+        Used with ``train.normalize_on_gpu``: the loader ships uint8 crops (4x
+        less shared/pinned host memory and IPC traffic than bf16/fp32), and the
+        normalization runs here in the compute dtype.
+        """
+        if crops.dtype != torch.uint8:
+            return crops
+        if self._gpu_normalize_scale is None or self._gpu_normalize_scale.device != crops.device:
+            dtype = {
+                "fp32": torch.float32,
+                "fp16": torch.float16,
+                "bf16": torch.bfloat16,
+            }[self.cfg.compute_precision.param_dtype]
+            mean = torch.as_tensor(list(self.cfg.crops.rgb_mean), device=crops.device, dtype=torch.float32)
+            std = torch.as_tensor(list(self.cfg.crops.rgb_std), device=crops.device, dtype=torch.float32)
+            # x / 255 / std - mean / std, folded into a fused multiply-add
+            self._gpu_normalize_scale = (1.0 / (255.0 * std)).reshape(1, 3, 1, 1).to(dtype)
+            self._gpu_normalize_shift = (-mean / std).reshape(1, 3, 1, 1).to(dtype)
+        return torch.addcmul(
+            self._gpu_normalize_shift,
+            crops.to(self._gpu_normalize_scale.dtype),
+            self._gpu_normalize_scale,
+        )
+
     def forward_backward(
         self, data, *, teacher_temp, iteration=0, loss_scale: float = 1.0, **ignored_kwargs
     ) -> tuple[Tensor, dict[str, float | Tensor]]:
@@ -366,8 +396,8 @@ class SSLMetaArch(nn.Module):
         metrics_dict["local_batch_size"] = B
         metrics_dict["global_batch_size"] = data["global_batch_size"]
 
-        global_crops = data["collated_global_crops"].cuda(non_blocking=True)
-        local_crops = data["collated_local_crops"].cuda(non_blocking=True)
+        global_crops = self._maybe_gpu_normalize(data["collated_global_crops"].cuda(non_blocking=True))
+        local_crops = self._maybe_gpu_normalize(data["collated_local_crops"].cuda(non_blocking=True))
         masks = data["collated_masks"].cuda(non_blocking=True)
         mask_indices_list = data["mask_indices_list"].cuda(non_blocking=True)
         masks_weight = data["masks_weight"].cuda(non_blocking=True)
@@ -377,7 +407,7 @@ class SSLMetaArch(nn.Module):
             assert "collated_gram_teacher_crops" in data, (
                 "no gram teacher crops in the data, have you set cfg.crops.gram_teacher_crops_size?"
             )
-            gram_teacher_crops = data["collated_gram_teacher_crops"].cuda(non_blocking=True)
+            gram_teacher_crops = self._maybe_gpu_normalize(data["collated_gram_teacher_crops"].cuda(non_blocking=True))
         else:
             gram_teacher_crops = None
 
@@ -760,6 +790,7 @@ class SSLMetaArch(nn.Module):
             horizontal_flips=cfg.crops.horizontal_flips,
             mean=cfg.crops.rgb_mean,
             std=cfg.crops.rgb_std,
+            normalize_in_loader=not cfg.train.get("normalize_on_gpu", False),
         )
 
     def get_maybe_fused_params_for_submodel(self, m: nn.Module):

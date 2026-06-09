@@ -6,7 +6,10 @@
 #   * registers never attend to other registers (incl. themselves),
 #   * register->(cls+patch) logits are softmaxed across the register/query
 #     dimension (competition), then key-renormalized (slot_mode=slot).
-# All other tokens behave exactly as in the baseline and may attend to registers.
+# In this config, CLS/patch tokens use `patch_cls_attn_type:
+# separate_register_budget`, so they attend to CLS+patch keys and register keys
+# with independent softmax budgets. Set it back to `standard` to make all
+# non-register tokens behave exactly as in the baseline.
 #
 # Merged on top of dinov3/configs/ssl_default_config.yaml.
 # Launch:  register_project/scripts/train_slot.sh
@@ -25,6 +28,7 @@ train:
   prefetch_factor: 1
   persistent_workers: true
   dataloader_multiprocessing_context: forkserver
+  normalize_on_gpu: true            # uint8 crops from workers, normalize on GPU (4x less host-RAM batch traffic)
   compile: true
   OFFICIAL_EPOCH_LENGTH: 1          # overwritten by the step-based schedule normalizer
   wandb:
@@ -43,6 +47,7 @@ student:
   register_attn_type: slot          # <-- slot-register competition attention
   slot_mode: slot                   # "slot" (key-renormalized weighted mean) or "literal"
   register_attn_exclude_cls: true   # registers compete over patch tokens only
+  patch_cls_attn_type: separate_register_budget  # CLS/patch get separate cls+patch and register attention budgets
   register_init: learned            # "gaussian" samples registers from shared Xavier-initialized mean/log-std
   register_gaussian_std_init: 0.02  # legacy compatibility field; ignored by masked_ocl-style init
 

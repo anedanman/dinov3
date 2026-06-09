@@ -112,16 +112,26 @@ Outputs (checkpoints, logs, `config.yaml`) land in `runs/<name>/`.
   logits over patches (or cls+patches with `register_attn_exclude_cls=false`)
   are softmaxed across the **register/query** dimension (competition).
   `slot_mode="slot"` adds slot-attention key renormalization (weighted mean);
-  `slot_mode="literal"` uses `out = A @ V`. All non-register tokens are
+  `slot_mode="literal"` uses `out = A @ V`. By default non-register tokens are
   unchanged and may attend to registers.
-  Implemented as fast SDPA for the bulk + explicit competition for register rows.
+- `patch_cls_attn_type="separate_register_budget"` changes CLS/patch query rows:
+  they run one key-softmax over CLS+patch keys and a second key-softmax over
+  register keys, then add the two value averages. This gives registers an
+  independent attention budget instead of making them compete with CLS/patch
+  keys inside the same softmax.
+  Implemented with fused SDPA kernels per query-row group (CLS/patch rows and,
+  where applicable, register rows) plus explicit fp32 competition for slot
+  register rows; outputs are concatenated, so nothing is computed twice and no
+  full-attention fallback or row overwrite is needed.
 - `extract_register_attention_maps(...)`: register→patch and patch→register
-  weights for viz/MBO, plus matching CLS maps. `extract_register_patch_attention(...)`
-  remains as the register→patch compatibility wrapper.
+  weights for viz/MBO, plus matching CLS maps, using the configured
+  `patch_cls_attn_type`. `extract_register_patch_attention(...)` remains as the
+  register→patch compatibility wrapper.
 
 **Model wiring** — `dinov3/models/vision_transformer.py`, `dinov3/models/__init__.py`
 - `register_attn_type` (`standard`|`slot`), `slot_mode`,
-  `register_attn_exclude_cls`, and `register_init` flow from config.
+  `register_attn_exclude_cls`, `patch_cls_attn_type`, and `register_init` flow
+  from config.
 - `register_init="gaussian"` mirrors `masked_ocl`: shared `[1, 1, D]`
   mean/log-std parameters initialized with Xavier uniform, with independent
   standard-normal noise sampled per image and register.
@@ -131,7 +141,8 @@ Outputs (checkpoints, logs, `config.yaml`) land in `runs/<name>/`.
 
 **Config** — `dinov3/configs/ssl_default_config.yaml`
 - `student.register_attn_type`, `student.slot_mode`,
-  `student.register_attn_exclude_cls`, `student.register_init`
+  `student.register_attn_exclude_cls`, `student.patch_cls_attn_type`,
+  `student.register_init`
 - `train.wandb.*`, `schedule.*` (step-based), `register_viz.*`, `mbo.*`
 
 **Step-based scheduling** — `dinov3/train/step_schedule.py`
@@ -144,6 +155,19 @@ Outputs (checkpoints, logs, `config.yaml`) land in `runs/<name>/`.
 - W&B init + per-step scalar logging.
 - Periodic register-attention viz + COCO MBO (`RegisterEvaluator`), run on a
   plain eval backbone kept in sync with the EMA teacher.
+
+**Host-memory hygiene (small-RAM hosts)** — `dinov3/utils/memory.py`,
+`dinov3/train/train.py`, `dinov3/data/augmentations.py`, `dinov3/train/ssl_meta_arch.py`
+- `train.normalize_on_gpu`: dataloader workers ship uint8 crops; scaling and
+  mean/std normalization run on the GPU in the compute dtype
+  (`SSLMetaArch._maybe_gpu_normalize`). Cuts shared-memory and pinned-host
+  batch traffic ~4x and saves worker CPU.
+- The periodic GC and post-eval cleanup also flush the CUDA pinned-host cache
+  (`release_memory(empty_pinned_cache=True)`): the caching host allocator never
+  returns blocks to the OS by itself, so its fragmentation-driven growth
+  otherwise looks like a slow host-RAM leak.
+- Eval dataloaders use `pin_memory=False`; the training log line reports the
+  pinned-cache size (`pinned: ...`).
 
 **Dataset** — `dinov3/data/datasets/imagenet_packed.py` (+ loader registration)
 - `ImageNetPacked`: mmap blob + index, random access for the SSL sampler.

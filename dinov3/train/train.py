@@ -345,15 +345,21 @@ def build_data_loader_from_cfg(
         local_batch_size = None  # will default to the standard local batch size matching the data batch size
         dataloader_batch_size_per_gpu = cfg.train.batch_size_per_gpu
 
+    if cfg.train.get("normalize_on_gpu", False):
+        # Crops travel as uint8 and are scaled/normalized on the GPU
+        # (SSLMetaArch._maybe_gpu_normalize): 4x less shm/pinned-host traffic.
+        collate_dtype = torch.uint8
+    else:
+        collate_dtype = {
+            "fp32": torch.float32,
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+        }[cfg.compute_precision.param_dtype]
     collate_fn = partial(
         collate_data_and_cast,
         mask_ratio_tuple=cfg.ibot.mask_ratio_min_max,
         mask_probability=cfg.ibot.mask_sample_probability,
-        dtype={
-            "fp32": torch.float32,
-            "fp16": torch.float16,
-            "bf16": torch.bfloat16,
-        }[cfg.compute_precision.param_dtype],
+        dtype=collate_dtype,
         n_tokens=n_tokens,
         mask_generator=mask_generator,
         random_circular_shift=cfg.ibot.mask_random_circular_shift,
@@ -502,7 +508,10 @@ def do_train(cfg, model, resume=False):
             torch.cuda.synchronize()
 
     def _release_eval_memory(reason: str):
-        release_memory(empty_cuda_cache=bool(cfg.train.get("empty_cuda_cache_after_eval", False)))
+        release_memory(
+            empty_cuda_cache=bool(cfg.train.get("empty_cuda_cache_after_eval", False)),
+            empty_pinned_cache=True,
+        )
         logger.info("Released temporary memory after %s", reason)
 
     def _run_register_validation(step: int, run_viz: bool, run_mbo: bool, reason: str):
@@ -630,10 +639,13 @@ def do_train(cfg, model, resume=False):
         if iteration > max_iter:
             return
 
-        # Garbage collection (trigger manually so it happens on all ranks at the same time)
+        # Garbage collection (trigger manually so it happens on all ranks at the same time).
+        # Also flush unused pinned-host blocks: the caching host allocator never
+        # returns them to the OS on its own, so on small-RAM hosts its slow
+        # fragmentation-driven growth behaves like a leak.
         if (iteration + 1) % 150 == 0:
             logger.info("Garbage collection")
-            release_memory()
+            release_memory(empty_pinned_cache=True)
 
         if cfg.gram.use_loss and model.gram_it_load_ema_teacher == it:
             logger.info(f"Loading EMA teacher into Gram teacher before iteration {it}")
