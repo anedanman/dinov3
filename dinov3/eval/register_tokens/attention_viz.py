@@ -47,9 +47,24 @@ def _normalize_map(m: torch.Tensor) -> np.ndarray:
     return m.cpu().numpy()
 
 
-def _heat_overlay(base: np.ndarray, m: torch.Tensor, alpha: float = 0.5) -> np.ndarray:
-    heat = _colorize(_normalize_map(m))
+def _heat_overlay(base: np.ndarray, m: torch.Tensor, alpha: float = 0.5, normalized: bool = False) -> np.ndarray:
+    heat = _colorize(m.clamp(0, 1).cpu().numpy() if normalized else _normalize_map(m))
     return ((1.0 - alpha) * base + alpha * heat).astype(np.uint8)
+
+
+def _label_strip(labels, widths, height: int = 18) -> np.ndarray:
+    """One-row header of column labels, matching a list of column widths."""
+    from PIL import Image, ImageDraw
+
+    total = int(sum(widths))
+    img = Image.new("RGB", (total, height), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    x = 0
+    for label, w in zip(labels, widths):
+        if label:
+            draw.text((x + 3, 2), label, fill=(0, 0, 0))
+        x += int(w)
+    return np.asarray(img, dtype=np.uint8)
 
 
 def _distinct_colors(n: int) -> np.ndarray:
@@ -67,7 +82,7 @@ def _separator(height: int, width: int = 4) -> np.ndarray:
 
 
 @torch.no_grad()
-def load_viz_images(cfg, num_images: int) -> Tuple[torch.Tensor, List[np.ndarray]]:
+def load_viz_images(cfg, num_images: int, image_size: Optional[int] = None) -> Tuple[torch.Tensor, List[np.ndarray]]:
     """Load a fixed set of images for visualization.
 
     Returns (normalized [N,3,S,S] tensor, list of display uint8 images).
@@ -75,7 +90,7 @@ def load_viz_images(cfg, num_images: int) -> Tuple[torch.Tensor, List[np.ndarray
     from dinov3.data import make_dataset
     from dinov3.data.transforms import make_eval_transform
 
-    size = cfg.register_viz.image_size
+    size = int(image_size) if image_size is not None else cfg.register_viz.image_size
     mean, std = cfg.crops.rgb_mean, cfg.crops.rgb_std
     transform = make_eval_transform(
         resize_size=size, crop_size=size, resize_square=True, mean=mean, std=std
@@ -162,12 +177,23 @@ def _expand(s: str) -> str:
     return ":".join(out)
 
 
+def _assignment_overlay(base: np.ndarray, attn: torch.Tensor, colors: np.ndarray) -> np.ndarray:
+    """Argmax-register segmentation, alpha-modulated by assignment confidence."""
+    p = attn / (attn.sum(dim=0, keepdim=True) + 1e-8)  # per-pixel distribution over registers
+    conf, assign = p.max(dim=0)
+    seg = colors[assign.cpu().numpy()]
+    # Confident pixels show the register color strongly; ambiguous ones stay closer to the input.
+    alpha = (0.25 + 0.5 * conf).cpu().numpy()[..., None]
+    return ((1.0 - alpha) * base + alpha * seg).astype(np.uint8)
+
+
 def _render_mean_direction(base: np.ndarray, attn: torch.Tensor, cls_map: torch.Tensor, colors: np.ndarray) -> List[np.ndarray]:
     """Render per-register heatmaps, one joint mask, and one CLS map."""
-    reg_imgs = [_heat_overlay(base, attn[r]) for r in range(attn.shape[0])]
-    assign = attn.argmax(dim=0).cpu().numpy()
-    seg = colors[assign]
-    seg_overlay = (0.45 * base + 0.55 * seg).astype(np.uint8)
+    # Normalize register heatmaps jointly (shared max) so relative register
+    # magnitudes stay comparable within the image.
+    shared = attn / (attn.max() + 1e-8)
+    reg_imgs = [_heat_overlay(base, shared[r], normalized=True) for r in range(attn.shape[0])]
+    seg_overlay = _assignment_overlay(base, attn, colors)
     cls_overlay = _heat_overlay(base, cls_map)
     return reg_imgs + [seg_overlay, cls_overlay]
 
@@ -182,9 +208,7 @@ def _render_per_head_direction(
     head_masks = []
     cls_maps = []
     for h in range(attn.shape[0]):
-        assign = attn[h].argmax(dim=0).cpu().numpy()
-        seg = colors[assign]
-        head_masks.append((0.45 * base + 0.55 * seg).astype(np.uint8))
+        head_masks.append(_assignment_overlay(base, attn[h], colors))
         cls_maps.append(_heat_overlay(base, cls_map[h]))
     return head_masks + cls_maps
 
@@ -241,7 +265,22 @@ def render_register_attention(
     N = images.shape[0]
     colors = _distinct_colors(R)
 
-    panels = []
+    # Column labels matching the panel layout, rendered once as a header strip.
+    labels = ["input"]
+    widths = [S]
+    for direction in directions:
+        tag = "r2p" if direction == "register_to_patch" else "p2r"
+        labels.append("")
+        widths.append(4)  # separator
+        if head_reduce == "mean":
+            labels += [f"{tag} reg{r}" for r in range(R)] + [f"{tag} assign", f"{tag} cls"]
+            widths += [S] * (R + 2)
+        else:
+            heads = attn_up[direction].shape[1]
+            labels += [f"{tag} head{h}" for h in range(heads)] + [f"{tag} cls h{h}" for h in range(heads)]
+            widths += [S] * (2 * heads)
+
+    panels = [_label_strip(labels, widths)]
     for i in range(N):
         base = display[i]
         columns = [base]

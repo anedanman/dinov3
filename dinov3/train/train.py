@@ -557,6 +557,32 @@ def do_train(cfg, model, resume=False):
             _synchronize_cuda()
             _release_eval_memory("register validation")
 
+    def _run_register_diagnostics(step: int, reason: str):
+        if not register_evaluator.should_run_diagnostics(step):
+            return
+        _synchronize_cuda()
+        try:
+            register_evaluator.sync(model)  # collective (full_tensor); all ranks must call
+            if distributed.is_main_process():
+                try:
+                    diag_metrics = register_evaluator.run_diagnostics()
+                    wandb_logger.log_scalars(wandb_run, diag_metrics, step=step)
+                    logger.info(
+                        "Register diagnostics at step %d (%s): "
+                        "slot_usage_entropy=%.3f active_slots=%.2f xcrop_cos=%.3f outlier_frac=%.4f",
+                        step,
+                        reason,
+                        diag_metrics.get("register_diag/slot_usage_entropy", float("nan")),
+                        diag_metrics.get("register_diag/active_slots", float("nan")),
+                        diag_metrics.get("register_diag/xcrop_matched_cos", float("nan")),
+                        diag_metrics.get("register_diag/patch_norm_outlier_frac", float("nan")),
+                    )
+                except Exception as e:
+                    logger.warning(f"register diagnostics failed: {e}")
+        finally:
+            model.train()
+            _synchronize_cuda()
+
     def _run_simple_validation(step: int, reason: str):
         simple_due = simple_evaluator.due(step, final_step=max_iter - 1)
         if not simple_due.any:
@@ -765,6 +791,9 @@ def do_train(cfg, model, resume=False):
             for k, v in metrics_dict.items():
                 scalars[f"train/{k}"] = v.item() if torch.is_tensor(v) else v
             wandb_logger.log_scalars(wandb_run, scalars, step=iteration)
+
+        # Cheap quantitative register diagnostics (fixed batch, scalar metrics)
+        _run_register_diagnostics(iteration, reason="scheduled")
 
         # Register-token evaluation: attention visualization + COCO MBO
         run_viz = register_evaluator.should_run_viz(iteration)

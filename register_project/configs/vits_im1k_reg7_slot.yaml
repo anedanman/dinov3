@@ -25,7 +25,7 @@ train:
   dataset_path: ImageNetPacked:split=TRAIN:root=~/datasets/imagenet1k_packed
   num_workers: 12
   pin_memory: true
-  prefetch_factor: 1
+  prefetch_factor: 2
   persistent_workers: true
   dataloader_multiprocessing_context: forkserver
   normalize_on_gpu: true            # uint8 crops from workers, normalize on GPU (4x less host-RAM batch traffic)
@@ -94,21 +94,30 @@ evaluation:
       image_size: 256
 
 checkpointing:
-  period: 5000
+  period: 2500                      # latest checkpoint every 2500 steps (~80 min of max lost work)
   max_to_keep: 3
+  keep_every: 25000                 # milestone checkpoints kept forever (training-dynamics analysis / probing)
+
+register_diagnostics:
+  enabled: true                     # cheap scalar diagnostics: slot usage, outlier tokens, cross-crop agreement, gates
+  every_n_steps: 500
+  num_images: 32
+  image_size: 256
+  outlier_ratio: 2.0
+  crop_pairs: true
 
 register_viz:
   enabled: true
-  every_n_steps: 2500
-  num_images: 8
-  coco_num_images: 2
+  every_n_steps: 10000
+  num_images: 16
+  coco_num_images: 6
   layer: -1
   dataset: ImageNetPacked:split=VAL:root=~/datasets/imagenet1k_packed
   image_size: 256
 
 mbo:
   enabled: true
-  every_n_steps: 5000
+  every_n_steps: 10000
   coco_root: ~/datasets/coco
   split: val2017
   max_images: 2000

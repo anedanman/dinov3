@@ -177,6 +177,7 @@ def compute_patch_cls_separate_register_budget(
     v: Tensor,
     n_storage_tokens: int,
     scale: float,
+    gate: Tensor | None = None,
 ) -> Tensor:
     """Attention output for CLS/patch rows with a separate register budget.
 
@@ -184,6 +185,9 @@ def compute_patch_cls_separate_register_budget(
     to non-register keys with one key-softmax and to register keys with a second
     key-softmax. The two value averages are then added, so registers no longer
     compete with CLS/patch tokens for the same attention probability mass.
+
+    ``gate`` (optional, broadcastable to [B, heads, 1, 1]) scales the register
+    budget: ``out = out_nonreg + gate * out_reg``. ``gate=1`` is the ungated case.
     """
     R = n_storage_tokens
     q_nonreg = torch.cat([q[:, :, :1, :], q[:, :, 1 + R :, :]], dim=-2)  # [B,h,1+P,d]
@@ -193,6 +197,8 @@ def compute_patch_cls_separate_register_budget(
     out_reg = F.scaled_dot_product_attention(
         q_nonreg, k[:, :, 1 : 1 + R, :], v[:, :, 1 : 1 + R, :], scale=scale
     )
+    if gate is not None:
+        out_reg = gate * out_reg
     return out_nonreg + out_reg
 
 
@@ -323,12 +329,26 @@ class PatchClsSeparateRegisterBudgetAttention(SelfAttention):
     Register query rows use standard self-attention. CLS and patch rows use one
     softmax over CLS+patch keys and one softmax over register keys; the two
     outputs are added.
+
+    ``register_budget_gate`` adds a learnable per-head multiplier on the register
+    budget (initialized to 1, i.e. exactly the ungated behaviour at init), so the
+    model can learn how much each head reads from registers.
     """
 
-    def __init__(self, *args, n_storage_tokens: int = 0, **kwargs) -> None:
+    def __init__(self, *args, n_storage_tokens: int = 0, register_budget_gate: bool = False, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         assert n_storage_tokens > 0, "separate register budget requires n_storage_tokens > 0"
         self.n_storage_tokens = n_storage_tokens
+        if register_budget_gate:
+            device = self.qkv.weight.device
+            self.reg_budget_gate = nn.Parameter(torch.empty(self.num_heads, device=device))
+        else:
+            self.reg_budget_gate = None
+
+    def _register_budget_gate(self, dtype: torch.dtype) -> Tensor | None:
+        if self.reg_budget_gate is None:
+            return None
+        return self.reg_budget_gate.to(dtype).view(1, -1, 1, 1)
 
     def compute_attention(self, qkv: Tensor, attn_bias=None, rope=None) -> Tensor:
         assert attn_bias is None
@@ -342,7 +362,9 @@ class PatchClsSeparateRegisterBudgetAttention(SelfAttention):
             q, k = self.apply_rope(q, k, rope)
         # Register query rows keep standard attention over all keys.
         out_reg = F.scaled_dot_product_attention(q[:, :, 1 : 1 + R, :], k, v)
-        patch_cls_rows = compute_patch_cls_separate_register_budget(q, k, v, R, self.scale)
+        patch_cls_rows = compute_patch_cls_separate_register_budget(
+            q, k, v, R, self.scale, gate=self._register_budget_gate(v.dtype)
+        )
         x = torch.cat([patch_cls_rows[:, :, :1, :], out_reg, patch_cls_rows[:, :, 1:, :]], dim=-2)
         x = x.transpose(1, 2)
         return x.reshape([B, N, C])
@@ -363,7 +385,8 @@ class RegisterSlotAttention(SelfAttention):
       * "literal": ``out = A @ v`` with no second normalization.
 
     ``patch_cls_attn_type`` optionally changes CLS/patch rows to give registers
-    their own independent key-softmax budget.
+    their own independent key-softmax budget; ``register_budget_gate`` adds a
+    learnable per-head multiplier on that budget (init 1 = ungated behaviour).
     """
 
     def __init__(
@@ -373,6 +396,7 @@ class RegisterSlotAttention(SelfAttention):
         slot_mode: str = "slot",
         exclude_cls: bool = True,
         patch_cls_attn_type: str = "standard",
+        register_budget_gate: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -381,11 +405,24 @@ class RegisterSlotAttention(SelfAttention):
         assert patch_cls_attn_type in ("standard", "separate_register_budget"), (
             f"unknown patch_cls_attn_type={patch_cls_attn_type}"
         )
+        assert not register_budget_gate or patch_cls_attn_type == "separate_register_budget", (
+            "register_budget_gate requires patch_cls_attn_type='separate_register_budget'"
+        )
         self.n_storage_tokens = n_storage_tokens
         self.slot_mode = slot_mode
         self.slot_renorm = slot_mode == "slot"
         self.exclude_cls = exclude_cls
         self.patch_cls_attn_type = patch_cls_attn_type
+        if register_budget_gate:
+            device = self.qkv.weight.device
+            self.reg_budget_gate = nn.Parameter(torch.empty(self.num_heads, device=device))
+        else:
+            self.reg_budget_gate = None
+
+    def _register_budget_gate(self, dtype: torch.dtype) -> Tensor | None:
+        if self.reg_budget_gate is None:
+            return None
+        return self.reg_budget_gate.to(dtype).view(1, -1, 1, 1)
 
     def compute_attention(self, qkv: Tensor, attn_bias=None, rope=None) -> Tensor:
         assert attn_bias is None
@@ -398,7 +435,9 @@ class RegisterSlotAttention(SelfAttention):
         if rope is not None:
             q, k = self.apply_rope(q, k, rope)
         if self.patch_cls_attn_type == "separate_register_budget":
-            patch_cls_rows = compute_patch_cls_separate_register_budget(q, k, v, R, self.scale)
+            patch_cls_rows = compute_patch_cls_separate_register_budget(
+                q, k, v, R, self.scale, gate=self._register_budget_gate(v.dtype)
+            )
         else:
             # CLS/patch rows use standard attention over all keys (incl. registers).
             q_nonreg = torch.cat([q[:, :, :1, :], q[:, :, 1 + R :, :]], dim=-2)

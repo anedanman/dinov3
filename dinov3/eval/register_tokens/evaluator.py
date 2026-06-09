@@ -17,6 +17,7 @@ import torch
 
 from .attention_viz import load_coco_viz_images, load_viz_images, render_register_attention
 from .backbone import build_eval_backbone, sync_eval_backbone
+from .diagnostics import RegisterDiagnostics
 from .mbo import compute_coco_mbo
 
 logger = logging.getLogger("dinov3")
@@ -27,6 +28,9 @@ class RegisterEvaluator:
         self.cfg = cfg
         self.viz_enabled = cfg.register_viz.enabled and cfg.student.n_storage_tokens > 0
         self.mbo_enabled = cfg.mbo.enabled and cfg.student.n_storage_tokens > 0
+        diag_cfg = cfg.get("register_diagnostics", None)
+        self.diag_enabled = bool(diag_cfg and diag_cfg.enabled and cfg.student.n_storage_tokens > 0)
+        self._diagnostics = RegisterDiagnostics(cfg) if self.diag_enabled else None
         self._eval_backbone = None
         self._viz_images = None
         self._viz_display = None
@@ -57,6 +61,9 @@ class RegisterEvaluator:
 
     def should_run_mbo(self, step: int) -> bool:
         return self.mbo_enabled and (step + 1) % self.cfg.mbo.every_n_steps == 0
+
+    def should_run_diagnostics(self, step: int) -> bool:
+        return self.diag_enabled and (step + 1) % self.cfg.register_diagnostics.every_n_steps == 0
 
     @torch.no_grad()
     def sync(self, model):
@@ -98,3 +105,7 @@ class RegisterEvaluator:
     @torch.no_grad()
     def run_mbo(self):
         return compute_coco_mbo(self._backbone(), self.cfg)
+
+    @torch.no_grad()
+    def run_diagnostics(self):
+        return self._diagnostics.run(self._backbone())

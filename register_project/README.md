@@ -7,15 +7,27 @@ mechanism.
 Everything is driven by a single YAML config (merged on top of
 `dinov3/configs/ssl_default_config.yaml`). Two ready-to-run experiments:
 
-| Experiment | Config | Register attention |
-|---|---|---|
-| Baseline | `configs/vits_im1k_reg7_baseline.yaml` | standard self-attention |
-| Slot-register | `configs/vits_im1k_reg7_slot.yaml` | slot-attention competition |
+| Experiment | Script | wandb name | Delta |
+|---|---|---|---|
+| Baseline | `scripts/train_baseline.sh` | `vits-reg7-baseline` | standard self-attention |
+| Slot | `scripts/train_slot.sh` | `vits-reg7-slot` | slot competition |
+| Slot2 | `scripts/train_slot2.sh` | `vits-reg7-slot2` | + separate register budget + gaussian init |
+| Slot3 | `scripts/train_slot3_xcrop.sh` | `vits-reg7-slot3-xcrop` | slot2 + cross-crop register consistency loss |
+| Slot4 | `scripts/train_slot4_late.sh` | `vits-reg7-slot4-late6` | slot2 + competition only in layers 6-11 |
+| Slot5 | `scripts/train_slot5_gate.sh` | `vits-reg7-slot5-gate` | slot2 + learnable register-budget gate |
 
-Both: **ViT-S/16 (~21.6M params)**, **7 register tokens**, **effective batch 512**
-(128 micro-batch × 4 gradient-accumulation steps on a single GPU), **256/112 crops**,
-step-based schedule, Weights & Biases logging, periodic register-attention
-visualization, and **COCO MBO** (instance + semantic) at validation.
+Baseline uses `configs/vits_im1k_reg7_baseline.yaml`; all slot variants share
+`configs/vits_im1k_reg7_slot.yaml` plus per-script overrides. New runs use a
+**256 micro-batch x 2 grad-accum** (same effective batch 512); the older
+`train_slot2.sh` keeps 128x4 for checkpoint continuity. All runs log register
+diagnostics every 500 steps, keep the latest checkpoint every 2500 steps plus a
+permanent milestone every 25k, and run viz + COCO MBO every 10k steps.
+
+All: **ViT-S/16 (~21.6M params)**, **7 register tokens**, **effective batch 512**
+(gradient accumulation on a single GPU), **256/112 crops**, step-based schedule,
+Weights & Biases logging, register diagnostics every 500 steps, periodic
+register-attention visualization, and **COCO MBO** (instance + semantic) at
+validation.
 
 ---
 
@@ -128,10 +140,46 @@ Outputs (checkpoints, logs, `config.yaml`) land in `runs/<name>/`.
   `patch_cls_attn_type`. `extract_register_patch_attention(...)` remains as the
   register→patch compatibility wrapper.
 
+**Cross-crop register consistency loss** — `dinov3/loss/register_consistency_loss.py`
+- `register_consistency.*` config: student registers of one global crop are
+  pulled toward the teacher registers of the *other* global crop, matched per
+  image with Hungarian assignment on cosine similarity (`matching: hungarian`,
+  or `fixed` for index-aligned registers). Loss is mean `(1 - cos)` over the
+  matched pairs, with optional linear `warmup_steps` and optional
+  `include_local` (student local crops vs teacher globals).
+  Enabled in `train_slot3_xcrop.sh`.
+
+**Layer-restricted slot competition** — `student.slot_start_layer`
+- Blocks before `slot_start_layer` use standard register rows (keeping
+  `patch_cls_attn_type`); blocks from it onward use slot competition. Attention
+  extraction (viz/MBO/diagnostics) uses the per-layer convention automatically.
+  `train_slot4_late.sh` starts the competition at layer 6 (of 12).
+
+**Learnable register-budget gate** — `student.register_budget_gate`
+- Per-head, per-layer multiplier on the separate register budget:
+  `out = out_nonreg + g * out_reg`, `g` init 1 (exactly ungated at init), no
+  weight decay. Gate values appear in wandb under `register_gate/*` (per layer
+  mean/min/max over heads), logged by the register diagnostics from the EMA
+  teacher. Enabled in `train_slot5_gate.sh`.
+
+**Register diagnostics** — `dinov3/eval/register_tokens/diagnostics.py`
+- `register_diagnostics.*` config (default every 500 steps, 32 fixed images, a
+  few seconds per run, EMA-teacher backbone). wandb scalars under
+  `register_diag/*`:
+  * slot usage: `slot_share_max/min`, `slot_usage_entropy` (1 = balanced),
+    `active_slots`, `patch_assign_entropy` (competition softness),
+    `slot_spatial_entropy`;
+  * register features: `reg_norm_mean`, `reg_pairwise_cos` (redundancy);
+  * patch-token outliers (the original register motivation):
+    `patch_norm_outlier_frac[_3x]`, `patch_norm_max/p99_over_median`,
+    `register_norm_over_patch_median`, `cls_norm_over_patch_median`;
+  * cross-crop agreement on two fixed views: `xcrop_matched_cos`
+    (Hungarian-matched register cosine), `xcrop_identity_match_frac`.
+
 **Model wiring** — `dinov3/models/vision_transformer.py`, `dinov3/models/__init__.py`
 - `register_attn_type` (`standard`|`slot`), `slot_mode`,
-  `register_attn_exclude_cls`, `patch_cls_attn_type`, and `register_init` flow
-  from config.
+  `register_attn_exclude_cls`, `patch_cls_attn_type`, `slot_start_layer`,
+  `register_budget_gate`, and `register_init` flow from config.
 - `register_init="gaussian"` mirrors `masked_ocl`: shared `[1, 1, D]`
   mean/log-std parameters initialized with Xavier uniform, with independent
   standard-normal noise sampled per image and register.

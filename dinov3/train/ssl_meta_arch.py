@@ -17,7 +17,7 @@ from dinov3.configs import get_default_config
 from dinov3.data import DataAugmentationDINO
 from dinov3.fsdp.ac_compile_parallelize import ac_compile_parallelize
 from dinov3.layers.dino_head import DINOHead
-from dinov3.loss import DINOLoss, GramLoss, KoLeoLoss, KoLeoLossDistributed, iBOTPatchLoss
+from dinov3.loss import DINOLoss, GramLoss, KoLeoLoss, KoLeoLossDistributed, iBOTPatchLoss, register_consistency_loss
 from dinov3.models import build_model_from_cfg
 from dinov3.train.cosine_lr_scheduler import linear_warmup_cosine_decay
 from dinov3.train.param_groups import fuse_params_groups, get_params_groups_with_decay_fsdp
@@ -149,6 +149,20 @@ class SSLMetaArch(nn.Module):
         self.dino_loss_weight = self.cfg.dino.loss_weight
         self.dino_koleo_loss_weight = self.cfg.dino.koleo_loss_weight
         self.ibot_loss_weight = self.cfg.ibot.loss_weight
+
+        # Cross-crop register consistency loss
+        rc_cfg = self.cfg.get("register_consistency", None)
+        self.register_consistency_enabled = bool(rc_cfg and rc_cfg.enabled and cfg.student.n_storage_tokens > 0)
+        if self.register_consistency_enabled:
+            self.register_consistency_weight = float(rc_cfg.loss_weight)
+            self.register_consistency_matching = str(rc_cfg.get("matching", "hungarian"))
+            self.register_consistency_include_local = bool(rc_cfg.get("include_local", False))
+            self.register_consistency_warmup_steps = int(rc_cfg.get("warmup_steps", 0))
+            logger.info("OPTIONS -- REGISTER CONSISTENCY")
+            logger.info(f"OPTIONS -- REGISTER CONSISTENCY -- loss_weight: {self.register_consistency_weight}")
+            logger.info(f"OPTIONS -- REGISTER CONSISTENCY -- matching: {self.register_consistency_matching}")
+            logger.info(f"OPTIONS -- REGISTER CONSISTENCY -- include_local: {self.register_consistency_include_local}")
+            logger.info(f"OPTIONS -- REGISTER CONSISTENCY -- warmup_steps: {self.register_consistency_warmup_steps}")
 
         # Local loss reweighting
         if self.cfg.dino.reweight_dino_local_loss:
@@ -670,6 +684,33 @@ class SSLMetaArch(nn.Module):
         koleo_loss = sum(self.koleo_loss(x) for x in student_global["cls_pre_head"]) / n_global_crops
         loss_dict["koleo_loss"] = koleo_loss
         loss_accumulator += self.dino_koleo_loss_weight * koleo_scale * koleo_loss
+
+        # Cross-crop register consistency: student registers of one global crop
+        # match (Hungarian) the teacher registers of the other global crop.
+        if self.register_consistency_enabled:
+            rc_loss = register_consistency_loss(
+                student_global["reg_pre_head"],
+                teacher_global["reg_pre_head"],
+                matching=self.register_consistency_matching,
+            )
+            if self.register_consistency_include_local:
+                n_teacher = teacher_global["reg_pre_head"].shape[0]
+                local_pairs = [(i, j) for i in range(n_local_crops) for j in range(n_teacher)]
+                rc_loss = 0.5 * rc_loss + 0.5 * register_consistency_loss(
+                    student_local["reg_pre_head"],
+                    teacher_global["reg_pre_head"],
+                    matching=self.register_consistency_matching,
+                    pairs=local_pairs,
+                )
+            if self.register_consistency_warmup_steps > 0:
+                rc_weight = self.register_consistency_weight * min(
+                    1.0, (iteration + 1) / self.register_consistency_warmup_steps
+                )
+            else:
+                rc_weight = self.register_consistency_weight
+            loss_dict["register_consistency_loss"] = rc_loss
+            loss_dict["register_consistency_weight"] = rc_weight
+            loss_accumulator += rc_weight * rc_loss
 
         # IBOT loss
         ibot_patch_loss = self.ibot_patch_loss.forward_masked(

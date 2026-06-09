@@ -95,8 +95,15 @@ def get_params_groups_with_decay(model, lr_decay_rate=1.0, patch_embed_lr_mult=1
         if "last_layer" in name:
             d["is_last_layer"] = True
 
-        # No weight-decay on biases, norm parameters, layer scale gamma, learned tokens and embeddings
-        if name.endswith("bias") or "norm" in name or "gamma" in name or "fourier_w" in name:
+        # No weight-decay on biases, norm parameters, layer scale gamma, learned tokens, embeddings
+        # and register-budget gates (decay would pull the gates toward 0 instead of their init of 1)
+        if (
+            name.endswith("bias")
+            or "norm" in name
+            or "gamma" in name
+            or "fourier_w" in name
+            or "reg_budget_gate" in name
+        ):
             d["wd_multiplier"] = 0.0
 
         if "patch_embed" in name:
@@ -157,8 +164,15 @@ def get_params_groups_with_decay_fsdp(model, lr_decay_rate=1.0, patch_embed_lr_m
         if "last_layer" in name:
             d["is_last_layer"] = True
 
-        # No weight-decay on biases, norm parameters, layer scale gamma, learned tokens and embeddings
-        if name.endswith("bias") or "norm" in name or "gamma" in name or "fourier_w" in name:
+        # No weight-decay on biases, norm parameters, layer scale gamma, learned tokens, embeddings
+        # and register-budget gates (decay would pull the gates toward 0 instead of their init of 1)
+        if (
+            name.endswith("bias")
+            or "norm" in name
+            or "gamma" in name
+            or "fourier_w" in name
+            or "reg_budget_gate" in name
+        ):
             d["wd_multiplier"] = 0.0
 
         if "patch_embed" in name:

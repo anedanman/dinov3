@@ -58,6 +58,8 @@ def build_model(args, only_teacher=False, img_size=224, device=None):
             slot_mode=getattr(args, "slot_mode", "slot"),
             register_attn_exclude_cls=getattr(args, "register_attn_exclude_cls", True),
             patch_cls_attn_type=getattr(args, "patch_cls_attn_type", "standard"),
+            slot_start_layer=getattr(args, "slot_start_layer", 0),
+            register_budget_gate=getattr(args, "register_budget_gate", False),
             register_init=getattr(args, "register_init", "learned"),
             register_gaussian_std_init=getattr(args, "register_gaussian_std_init", 0.02),
             device=device,

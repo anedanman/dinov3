@@ -50,6 +50,9 @@ dtype_dict = {
 
 
 def init_weights_vit(module: nn.Module, name: str = ""):
+    if getattr(module, "reg_budget_gate", None) is not None:
+        # Learnable register-budget gate: start at 1 (exactly ungated behaviour).
+        nn.init.ones_(module.reg_budget_gate)
     if isinstance(module, nn.Linear):
         torch.nn.init.trunc_normal_(module.weight, std=0.02)
         if module.bias is not None:
@@ -102,6 +105,8 @@ class DinoVisionTransformer(nn.Module):
         slot_mode: str = "slot",
         register_attn_exclude_cls: bool = True,
         patch_cls_attn_type: str = "standard",
+        slot_start_layer: int = 0,
+        register_budget_gate: bool = False,
         register_init: str = "learned",
         register_gaussian_std_init: float = 0.02,
         device: Any | None = None,
@@ -170,36 +175,55 @@ class DinoVisionTransformer(nn.Module):
         assert patch_cls_attn_type in ("standard", "separate_register_budget"), (
             f"unknown patch_cls_attn_type={patch_cls_attn_type}"
         )
+        assert 0 <= slot_start_layer < depth, f"slot_start_layer={slot_start_layer} out of range for depth={depth}"
+        assert not register_budget_gate or patch_cls_attn_type == "separate_register_budget", (
+            "register_budget_gate requires patch_cls_attn_type='separate_register_budget'"
+        )
         self.register_attn_type = register_attn_type
         self.slot_mode = slot_mode
         self.register_attn_exclude_cls = register_attn_exclude_cls
         self.patch_cls_attn_type = patch_cls_attn_type
+        self.slot_start_layer = slot_start_layer
+        self.register_budget_gate = register_budget_gate
+
         if register_attn_type == "slot":
             assert n_storage_tokens > 0, "register_attn_type='slot' requires n_storage_tokens > 0"
             logger.info(
                 "using SLOT register attention "
                 f"(mode={slot_mode}, exclude_cls={register_attn_exclude_cls}, "
-                f"patch_cls_attn_type={patch_cls_attn_type}) with {n_storage_tokens} registers"
-            )
-            attn_class = partial(
-                RegisterSlotAttention,
-                n_storage_tokens=n_storage_tokens,
-                slot_mode=slot_mode,
-                exclude_cls=register_attn_exclude_cls,
-                patch_cls_attn_type=patch_cls_attn_type,
+                f"patch_cls_attn_type={patch_cls_attn_type}, slot_start_layer={slot_start_layer}, "
+                f"register_budget_gate={register_budget_gate}) with {n_storage_tokens} registers"
             )
         elif patch_cls_attn_type == "separate_register_budget":
             assert n_storage_tokens > 0, "patch_cls_attn_type='separate_register_budget' requires n_storage_tokens > 0"
             logger.info(
                 "using separate register attention budget for CLS/patch rows "
-                f"with {n_storage_tokens} registers"
+                f"(register_budget_gate={register_budget_gate}) with {n_storage_tokens} registers"
             )
-            attn_class = partial(
-                PatchClsSeparateRegisterBudgetAttention,
-                n_storage_tokens=n_storage_tokens,
-            )
-        else:
-            attn_class = SelfAttention
+
+        slot_attn_class = partial(
+            RegisterSlotAttention,
+            n_storage_tokens=n_storage_tokens,
+            slot_mode=slot_mode,
+            exclude_cls=register_attn_exclude_cls,
+            patch_cls_attn_type=patch_cls_attn_type,
+            register_budget_gate=register_budget_gate,
+        )
+        budget_attn_class = partial(
+            PatchClsSeparateRegisterBudgetAttention,
+            n_storage_tokens=n_storage_tokens,
+            register_budget_gate=register_budget_gate,
+        )
+
+        def attn_class_for_layer(i: int):
+            # Layers before `slot_start_layer` skip the slot competition but keep
+            # the separate register budget (so the only delta vs. the budget
+            # baseline is *where* the competition applies).
+            if register_attn_type == "slot" and i >= slot_start_layer:
+                return slot_attn_class
+            if patch_cls_attn_type == "separate_register_budget":
+                return budget_attn_class
+            return SelfAttention
 
         blocks_list = [
             SelfAttentionBlock(
@@ -214,7 +238,7 @@ class DinoVisionTransformer(nn.Module):
                 act_layer=nn.GELU,
                 ffn_layer=ffn_layer_cls,
                 init_values=layerscale_init,
-                attn_class=attn_class,
+                attn_class=attn_class_for_layer(i),
                 mask_k_bias=mask_k_bias,
                 device=device,
             )
@@ -396,6 +420,12 @@ class DinoVisionTransformer(nn.Module):
         elif return_class_token and return_extra_tokens:
             return tuple(zip(outputs, class_tokens, extra_tokens))
 
+    def register_attn_type_at_layer(self, layer: int) -> str:
+        """Register-row attention convention at a given block index."""
+        if self.register_attn_type == "slot" and (layer % self.n_blocks) >= self.slot_start_layer:
+            return "slot"
+        return "standard"
+
     def _normalize_attention_layers(self, layers: Optional[Sequence[int]] = None) -> List[int]:
         if layers is None:
             return list(range(self.n_blocks))
@@ -442,7 +472,7 @@ class DinoVisionTransformer(nn.Module):
                         scale=blk.attn.scale,
                         rope=rope,
                         apply_rope_fn=blk.attn.apply_rope,
-                        attn_type=self.register_attn_type,
+                        attn_type=self.register_attn_type_at_layer(i),
                         slot_renorm=(self.slot_mode == "slot"),
                         slot_exclude_cls=self.register_attn_exclude_cls,
                         patch_cls_attn_type=self.patch_cls_attn_type,
