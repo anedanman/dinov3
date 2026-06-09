@@ -366,21 +366,23 @@ class SSLMetaArch(nn.Module):
         if crops.dtype != torch.uint8:
             return crops
         if self._gpu_normalize_scale is None or self._gpu_normalize_scale.device != crops.device:
-            dtype = {
-                "fp32": torch.float32,
-                "fp16": torch.float16,
-                "bf16": torch.bfloat16,
-            }[self.cfg.compute_precision.param_dtype]
             mean = torch.as_tensor(list(self.cfg.crops.rgb_mean), device=crops.device, dtype=torch.float32)
             std = torch.as_tensor(list(self.cfg.crops.rgb_std), device=crops.device, dtype=torch.float32)
             # x / 255 / std - mean / std, folded into a fused multiply-add
-            self._gpu_normalize_scale = (1.0 / (255.0 * std)).reshape(1, 3, 1, 1).to(dtype)
-            self._gpu_normalize_shift = (-mean / std).reshape(1, 3, 1, 1).to(dtype)
+            self._gpu_normalize_scale = (1.0 / (255.0 * std)).reshape(1, 3, 1, 1)
+            self._gpu_normalize_shift = (-mean / std).reshape(1, 3, 1, 1)
+        dtype = {
+            "fp32": torch.float32,
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+        }[self.cfg.compute_precision.param_dtype]
+        # Normalize in fp32 and only then cast, matching the precision of the
+        # loader-side `normalize -> collate cast` pipeline bit-for-bit.
         return torch.addcmul(
             self._gpu_normalize_shift,
-            crops.to(self._gpu_normalize_scale.dtype),
+            crops.to(torch.float32),
             self._gpu_normalize_scale,
-        )
+        ).to(dtype)
 
     def forward_backward(
         self, data, *, teacher_temp, iteration=0, loss_scale: float = 1.0, **ignored_kwargs
