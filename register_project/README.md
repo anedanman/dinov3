@@ -170,10 +170,12 @@ Outputs (checkpoints, logs, `config.yaml`) land in `runs/<name>/`.
 **Symmetric register orthogonalization** — `student.register_orthogonalize`
 - After every block, the R register tokens are re-projected per image with
   Loewdin symmetric orthogonalization `Y = (XX^T + eps I)^{-1/2} X`
-  (`register_orth_eps`, default 1e-4) — the closest set of mutually orthogonal
-  vectors to the originals. Computed with Newton-Schulz iterations (matmuls
-  only: differentiable and stable for nearly collinear registers, where eigh
-  backward is not). `register_orth_preserve_norm` (default true) rescales each
+  (`register_orth_eps`, default 1e-6, relative to the mean Gram diagonal) —
+  the closest set of mutually orthogonal vectors to the originals. The
+  projection matrix is computed with a float64 eigh under no_grad (whitening
+  matrix treated as a constant), so gradients only flow through the `P @ X`
+  product and eigh's degenerate-spectrum backward instability never applies.
+  `register_orth_preserve_norm` (default true) rescales each
   register back to its pre-projection norm so only directions are constrained.
   Directly prevents the register collapse onto a shared direction observed in
   slot2/slot3. Enable with `student.register_orthogonalize=true`.
