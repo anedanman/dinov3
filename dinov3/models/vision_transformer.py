@@ -110,7 +110,7 @@ class DinoVisionTransformer(nn.Module):
         register_init: str = "learned",
         register_gaussian_std_init: float = 0.02,
         register_orthogonalize: bool = False,
-        register_orth_eps: float = 1e-5,
+        register_orth_eps: float = 1e-6,
         register_orth_preserve_norm: bool = True,
         device: Any | None = None,
         **ignored_kwargs,
@@ -341,17 +341,23 @@ class DinoVisionTransformer(nn.Module):
         the originals (in Frobenius norm). The inverse square root is computed
         with coupled Newton-Schulz iterations: pure matmuls, so it stays
         differentiable and stable even when the registers are nearly collinear
-        (eigh backward blows up on degenerate spectra).
+        (eigh backward blows up on degenerate spectra). float64 throughout:
+        for collapsed registers the residual structure sits ~1e-6 below the
+        Gram diagonal, at the edge of fp32 precision, and the cost is a few
+        tiny [B, R, R] ops per block.
         """
         R = self.n_storage_tokens
         reg = x[:, 1 : R + 1]
         orig_dtype = reg.dtype
-        r32 = reg.float()
-        eye = torch.eye(R, device=r32.device, dtype=torch.float32).expand(r32.shape[0], R, R)
-        gram = r32 @ r32.transpose(-1, -2)
+        r64 = reg.double()
+        eye = torch.eye(R, device=r64.device, dtype=torch.float64).expand(r64.shape[0], R, R)
+        gram = r64 @ r64.transpose(-1, -2)
         # Relative ridge: register norms vary by orders of magnitude over
-        # training, so the regularizer must scale with the Gram diagonal.
-        diag_mean = gram.diagonal(dim1=-2, dim2=-1).mean(-1).clamp_min(1e-12)[:, None, None]
+        # training, so the regularizer must scale with the Gram diagonal. It
+        # must also stay below the residual eigenvalue fraction of collapsed
+        # registers, or their residual directions are suppressed
+        # (lambda/(lambda+eps) -> 0) rather than orthogonalized.
+        diag_mean = gram.diagonal(dim1=-2, dim2=-1).mean(-1).clamp_min(1e-24)[:, None, None]
         gram = gram + (self.register_orth_eps * diag_mean) * eye
         # Trace upper-bounds the top eigenvalue (PSD), so gram_n has spectrum in (0, 1]
         # and the Newton-Schulz iteration converges. Small normalized eigenvalues
@@ -359,13 +365,13 @@ class DinoVisionTransformer(nn.Module):
         scale = gram.diagonal(dim1=-2, dim2=-1).sum(-1)[:, None, None]
         gram_n = gram / scale
         y, z = gram_n, eye
-        for _ in range(40):
+        for _ in range(50):
             t = 0.5 * (3.0 * eye - z @ y)
             y = y @ t
             z = t @ z
-        out = (z / scale.sqrt()) @ r32  # z ~ gram_n^{-1/2}
+        out = (z / scale.sqrt()) @ r64  # z ~ gram_n^{-1/2}
         if self.register_orth_preserve_norm:
-            out = out * (r32.norm(dim=-1, keepdim=True) / out.norm(dim=-1, keepdim=True).clamp_min(1e-6))
+            out = out * (r64.norm(dim=-1, keepdim=True) / out.norm(dim=-1, keepdim=True).clamp_min(1e-12))
         return torch.cat([x[:, :1], out.to(orig_dtype), x[:, R + 1 :]], dim=1)
 
     def forward_features_list(self, x_list: List[Tensor], masks_list: List[Tensor]) -> List[Dict[str, Tensor]]:
