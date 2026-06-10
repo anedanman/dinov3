@@ -272,6 +272,7 @@ register_consistency:
   matching: hungarian       # "hungarian" (per-image optimal permutation) or "fixed" (index-aligned registers)
   include_local: false      # also pull student local-crop registers toward teacher global-crop registers
   warmup_steps: 0           # linear ramp of the loss weight over this many steps (0 = constant)
+  subtract_mean: false      # match mean-subtracted register residuals (raw cosines saturate once registers share a dominant direction)
 
 register_diagnostics:
   enabled: false            # cheap quantitative register/outlier diagnostics on a fixed image batch

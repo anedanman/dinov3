@@ -158,11 +158,13 @@ class SSLMetaArch(nn.Module):
             self.register_consistency_matching = str(rc_cfg.get("matching", "hungarian"))
             self.register_consistency_include_local = bool(rc_cfg.get("include_local", False))
             self.register_consistency_warmup_steps = int(rc_cfg.get("warmup_steps", 0))
+            self.register_consistency_subtract_mean = bool(rc_cfg.get("subtract_mean", False))
             logger.info("OPTIONS -- REGISTER CONSISTENCY")
             logger.info(f"OPTIONS -- REGISTER CONSISTENCY -- loss_weight: {self.register_consistency_weight}")
             logger.info(f"OPTIONS -- REGISTER CONSISTENCY -- matching: {self.register_consistency_matching}")
             logger.info(f"OPTIONS -- REGISTER CONSISTENCY -- include_local: {self.register_consistency_include_local}")
             logger.info(f"OPTIONS -- REGISTER CONSISTENCY -- warmup_steps: {self.register_consistency_warmup_steps}")
+            logger.info(f"OPTIONS -- REGISTER CONSISTENCY -- subtract_mean: {self.register_consistency_subtract_mean}")
 
         # Local loss reweighting
         if self.cfg.dino.reweight_dino_local_loss:
@@ -692,6 +694,7 @@ class SSLMetaArch(nn.Module):
                 student_global["reg_pre_head"],
                 teacher_global["reg_pre_head"],
                 matching=self.register_consistency_matching,
+                subtract_mean=self.register_consistency_subtract_mean,
             )
             if self.register_consistency_include_local:
                 n_teacher = teacher_global["reg_pre_head"].shape[0]
@@ -701,6 +704,7 @@ class SSLMetaArch(nn.Module):
                     teacher_global["reg_pre_head"],
                     matching=self.register_consistency_matching,
                     pairs=local_pairs,
+                    subtract_mean=self.register_consistency_subtract_mean,
                 )
             if self.register_consistency_warmup_steps > 0:
                 rc_weight = self.register_consistency_weight * min(

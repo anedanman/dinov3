@@ -101,22 +101,43 @@ def register_feature_metrics(reg: Tensor) -> Dict[str, float]:
         cos = torch.einsum("brd,bsd->brs", z, z)  # [B, R, R]
         off_diag = cos.sum(dim=(1, 2)) - cos.diagonal(dim1=1, dim2=2).sum(dim=1)
         out["reg_pairwise_cos"] = (off_diag / (R * (R - 1))).mean().item()
+        # Same statistic on mean-subtracted residuals: registers share one
+        # dominant direction, so the raw cosine saturates near 1 while the
+        # residuals carry the actual slot differentiation.
+        resid = reg.float() - reg.float().mean(dim=1, keepdim=True)
+        zr = F.normalize(resid, dim=-1)
+        cos_r = torch.einsum("brd,bsd->brs", zr, zr)
+        off_diag_r = cos_r.sum(dim=(1, 2)) - cos_r.diagonal(dim1=1, dim2=2).sum(dim=1)
+        out["reg_resid_pairwise_cos"] = (off_diag_r / (R * (R - 1))).mean().item()
+        out["reg_resid_norm_frac"] = (resid.norm(dim=-1) / (norms + 1e-6)).mean().item()
     return out
 
 
 @torch.no_grad()
 def cross_crop_agreement(reg_a: Tensor, reg_b: Tensor) -> Dict[str, float]:
-    """Hungarian-matched register cosine across two views. reg_*: [B, R, D]."""
-    a = F.normalize(reg_a.float(), dim=-1)
-    b = F.normalize(reg_b.float(), dim=-1)
-    sim = torch.einsum("brd,bsd->brs", a, b)  # [B, R, R]
-    cols = hungarian_match(sim)  # [B, R]
-    matched = sim.gather(2, cols.unsqueeze(-1)).squeeze(-1)  # [B, R]
-    identity = torch.arange(sim.shape[1], device=cols.device).expand_as(cols)
-    return {
-        "xcrop_matched_cos": matched.mean().item(),
-        "xcrop_identity_match_frac": (cols == identity).float().mean().item(),
-    }
+    """Hungarian-matched register cosine across two views. reg_*: [B, R, D].
+
+    Reported both on raw registers and on mean-subtracted residuals; the raw
+    cosine saturates once the registers collapse onto a shared direction.
+    """
+    out = {}
+    for prefix, xa, xb in (
+        ("xcrop", reg_a.float(), reg_b.float()),
+        (
+            "xcrop_resid",
+            reg_a.float() - reg_a.float().mean(dim=1, keepdim=True),
+            reg_b.float() - reg_b.float().mean(dim=1, keepdim=True),
+        ),
+    ):
+        a = F.normalize(xa, dim=-1)
+        b = F.normalize(xb, dim=-1)
+        sim = torch.einsum("brd,bsd->brs", a, b)  # [B, R, R]
+        cols = hungarian_match(sim)  # [B, R]
+        matched = sim.gather(2, cols.unsqueeze(-1)).squeeze(-1)  # [B, R]
+        identity = torch.arange(sim.shape[1], device=cols.device).expand_as(cols)
+        out[f"{prefix}_matched_cos"] = matched.mean().item()
+        out[f"{prefix}_identity_match_frac"] = (cols == identity).float().mean().item()
+    return out
 
 
 @torch.no_grad()

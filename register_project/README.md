@@ -12,7 +12,7 @@ Everything is driven by a single YAML config (merged on top of
 | Baseline | `scripts/train_baseline.sh` | `vits-reg7-baseline` | standard self-attention |
 | Slot | `scripts/train_slot.sh` | `vits-reg7-slot` | slot competition |
 | Slot2 | `scripts/train_slot2.sh` | `vits-reg7-slot2` | + separate register budget + gaussian init |
-| Slot3 | `scripts/train_slot3_xcrop.sh` | `vits-reg7-slot3-xcrop` | slot2 + cross-crop register consistency loss |
+| Slot3 | `scripts/train_slot3_xcrop.sh` | `vits-reg7-slot3-xcrop2-resid` | slot2 + cross-crop register consistency loss on mean-subtracted residuals |
 | Slot4 | `scripts/train_slot4_late.sh` | `vits-reg7-slot4-late6` | slot2 + competition only in layers 6-11 |
 | Slot5 | `scripts/train_slot5_gate.sh` | `vits-reg7-slot5-gate` | slot2 + learnable register-budget gate |
 
@@ -147,7 +147,12 @@ Outputs (checkpoints, logs, `config.yaml`) land in `runs/<name>/`.
   or `fixed` for index-aligned registers). Loss is mean `(1 - cos)` over the
   matched pairs, with optional linear `warmup_steps` and optional
   `include_local` (student local crops vs teacher globals).
-  Enabled in `train_slot3_xcrop.sh`.
+- `subtract_mean: true` matches mean-subtracted register residuals instead of
+  raw registers. Registers collapse onto one shared direction early in slot
+  training (`reg_pairwise_cos` ~0.999), which saturates raw cosines and makes
+  the loss vacuous; the residuals carry the actual slot differentiation.
+  Enabled in `train_slot3_xcrop.sh` (first xcrop run without it confirmed the
+  trivial solution: consistency loss 0.94 -> 0.0003 by step 6k via collapse).
 
 **Layer-restricted slot competition** — `student.slot_start_layer`
 - Blocks before `slot_start_layer` use standard register rows (keeping
@@ -169,12 +174,15 @@ Outputs (checkpoints, logs, `config.yaml`) land in `runs/<name>/`.
   * slot usage: `slot_share_max/min`, `slot_usage_entropy` (1 = balanced),
     `active_slots`, `patch_assign_entropy` (competition softness),
     `slot_spatial_entropy`;
-  * register features: `reg_norm_mean`, `reg_pairwise_cos` (redundancy);
+  * register features: `reg_norm_mean`, `reg_pairwise_cos` (redundancy),
+    `reg_resid_pairwise_cos` / `reg_resid_norm_frac` (same on mean-subtracted
+    residuals — raw cosine saturates once registers share a direction);
   * patch-token outliers (the original register motivation):
     `patch_norm_outlier_frac[_3x]`, `patch_norm_max/p99_over_median`,
     `register_norm_over_patch_median`, `cls_norm_over_patch_median`;
   * cross-crop agreement on two fixed views: `xcrop_matched_cos`
-    (Hungarian-matched register cosine), `xcrop_identity_match_frac`.
+    (Hungarian-matched register cosine), `xcrop_identity_match_frac`, plus
+    `xcrop_resid_*` variants on mean-subtracted residuals.
 
 **Model wiring** — `dinov3/models/vision_transformer.py`, `dinov3/models/__init__.py`
 - `register_attn_type` (`standard`|`slot`), `slot_mode`,

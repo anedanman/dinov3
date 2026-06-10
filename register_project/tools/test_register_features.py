@@ -56,6 +56,25 @@ def test_consistency_loss():
     loss.backward()
     check("consistency: in [0,2] and differentiable", 0.0 <= loss.item() <= 2.0 and student.grad is not None)
 
+    # subtract_mean: collapsed registers (shared direction + small residuals)
+    # trivially saturate the raw-cosine loss but not the residual loss.
+    shared = torch.randn(1, B, 1, D) * 10.0
+    resid_s = 0.01 * torch.randn(1, B, R, D)
+    resid_t = 0.01 * torch.randn(1, B, R, D)
+    collapsed_s, collapsed_t = shared + resid_s, shared + resid_t
+    loss_raw = register_consistency_loss(collapsed_s, collapsed_t, pairs=[(0, 0)])
+    loss_resid = register_consistency_loss(collapsed_s, collapsed_t, pairs=[(0, 0)], subtract_mean=True)
+    check("consistency: raw cosine saturates under collapse", loss_raw.item() < 1e-3)
+    check("consistency: subtract_mean stays informative under collapse", loss_resid.item() > 0.1)
+
+    # subtract_mean is invariant to any shared offset and still zero for identical crops.
+    loss_id = register_consistency_loss(reg + 5.0, reg + 5.0, pairs=[(0, 0), (1, 1)], subtract_mean=True)
+    check("consistency: subtract_mean, identical crops -> 0", loss_id.item() < 1e-6)
+    student2 = torch.randn(2, B, R, D, requires_grad=True)
+    loss2 = register_consistency_loss(student2, teacher, subtract_mean=True)
+    loss2.backward()
+    check("consistency: subtract_mean differentiable", student2.grad is not None and torch.isfinite(student2.grad).all())
+
 
 def _tiny_vit(**kwargs):
     base = dict(
@@ -180,11 +199,15 @@ def test_diagnostics():
         "register_diag/patch_assign_entropy",
         "register_diag/reg_norm_mean",
         "register_diag/reg_pairwise_cos",
+        "register_diag/reg_resid_pairwise_cos",
+        "register_diag/reg_resid_norm_frac",
         "register_diag/patch_norm_outlier_frac",
         "register_diag/patch_norm_max_over_median",
         "register_diag/register_norm_over_patch_median",
         "register_diag/xcrop_matched_cos",
         "register_diag/xcrop_identity_match_frac",
+        "register_diag/xcrop_resid_matched_cos",
+        "register_diag/xcrop_resid_identity_match_frac",
         "register_gate/mean",
         "register_gate/layer_00",
     ]

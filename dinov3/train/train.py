@@ -569,12 +569,13 @@ def do_train(cfg, model, resume=False):
                     wandb_logger.log_scalars(wandb_run, diag_metrics, step=step)
                     logger.info(
                         "Register diagnostics at step %d (%s): "
-                        "slot_usage_entropy=%.3f active_slots=%.2f xcrop_cos=%.3f outlier_frac=%.4f",
+                        "slot_usage_entropy=%.3f active_slots=%.2f xcrop_cos=%.3f xcrop_resid_cos=%.3f outlier_frac=%.4f",
                         step,
                         reason,
                         diag_metrics.get("register_diag/slot_usage_entropy", float("nan")),
                         diag_metrics.get("register_diag/active_slots", float("nan")),
                         diag_metrics.get("register_diag/xcrop_matched_cos", float("nan")),
+                        diag_metrics.get("register_diag/xcrop_resid_matched_cos", float("nan")),
                         diag_metrics.get("register_diag/patch_norm_outlier_frac", float("nan")),
                     )
                 except Exception as e:

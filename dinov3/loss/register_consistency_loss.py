@@ -40,7 +40,12 @@ def hungarian_match(sim: Tensor) -> Tensor:
     return out.to(sim.device)
 
 
-def matched_cosine_loss(student_reg: Tensor, teacher_reg: Tensor, matching: str = "hungarian") -> Tensor:
+def matched_cosine_loss(
+    student_reg: Tensor,
+    teacher_reg: Tensor,
+    matching: str = "hungarian",
+    subtract_mean: bool = False,
+) -> Tensor:
     """Mean (1 - cos) between matched student/teacher registers of one crop pair.
 
     Args:
@@ -48,9 +53,19 @@ def matched_cosine_loss(student_reg: Tensor, teacher_reg: Tensor, matching: str 
         teacher_reg: [B, R, D] teacher register tokens (another crop), no grad.
         matching: "hungarian" (per-image optimal permutation) or "fixed"
             (index-aligned registers).
+        subtract_mean: subtract the per-image mean register before the cosine.
+            Registers tend to share one dominant direction (reg_pairwise_cos
+            ~0.99+), which makes raw cosines saturate and the loss vacuous;
+            matching the residuals keeps the loss acting on what actually
+            differentiates the slots.
     """
-    s = F.normalize(student_reg.float(), dim=-1)
-    t = F.normalize(teacher_reg.float(), dim=-1)
+    student_reg = student_reg.float()
+    teacher_reg = teacher_reg.float()
+    if subtract_mean:
+        student_reg = student_reg - student_reg.mean(dim=1, keepdim=True)
+        teacher_reg = teacher_reg - teacher_reg.mean(dim=1, keepdim=True)
+    s = F.normalize(student_reg, dim=-1)
+    t = F.normalize(teacher_reg, dim=-1)
     sim = torch.einsum("brd,bsd->brs", s, t)  # [B, R, R]
     if matching == "hungarian":
         cols = hungarian_match(sim)  # [B, R]
@@ -67,6 +82,7 @@ def register_consistency_loss(
     teacher_reg: Tensor,
     matching: str = "hungarian",
     pairs: Sequence[Tuple[int, int]] | None = None,
+    subtract_mean: bool = False,
 ) -> Tensor:
     """Cross-crop register consistency over crop pairs.
 
@@ -76,6 +92,8 @@ def register_consistency_loss(
         pairs: (student_crop, teacher_crop) index pairs. Default: every student
             crop against every *other* teacher crop (cross-view only), mirroring
             the DINO global loss with the diagonal ignored.
+        subtract_mean: match mean-subtracted register residuals (see
+            `matched_cosine_loss`).
     """
     n_student = student_reg.shape[0]
     n_teacher = teacher_reg.shape[0]
@@ -84,5 +102,7 @@ def register_consistency_loss(
     assert len(pairs) > 0, "register_consistency_loss needs at least one crop pair"
     loss = student_reg.new_zeros((), dtype=torch.float32)
     for i, j in pairs:
-        loss = loss + matched_cosine_loss(student_reg[i], teacher_reg[j].detach(), matching=matching)
+        loss = loss + matched_cosine_loss(
+            student_reg[i], teacher_reg[j].detach(), matching=matching, subtract_mean=subtract_mean
+        )
     return loss / len(pairs)
