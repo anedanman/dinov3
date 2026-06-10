@@ -180,6 +180,57 @@ def test_register_budget_gate():
     )
 
 
+def test_register_orthogonalization():
+    torch.manual_seed(0)
+    model = _tiny_vit(
+        register_attn_type="slot",
+        patch_cls_attn_type="separate_register_budget",
+        register_orthogonalize=True,
+    )
+    R, D = model.n_storage_tokens, model.embed_dim
+    B, P = 4, 4
+
+    def off_diag_cos(reg):
+        z = torch.nn.functional.normalize(reg.float(), dim=-1)
+        cos = torch.einsum("brd,bsd->brs", z, z)
+        return (cos - torch.eye(R).expand_as(cos)).abs().max().item()
+
+    # Random registers become (numerically) orthogonal, norms preserved.
+    x = torch.randn(B, 1 + R + P, D)
+    y = model._orthogonalize_registers(x)
+    reg_in, reg_out = x[:, 1 : R + 1], y[:, 1 : R + 1]
+    check("orth: register rows orthogonal after projection", off_diag_cos(reg_out) < 1e-2)
+    check(
+        "orth: norms preserved",
+        torch.allclose(reg_out.norm(dim=-1), reg_in.norm(dim=-1), rtol=1e-3),
+    )
+    check(
+        "orth: cls/patch rows untouched",
+        torch.equal(y[:, 0], x[:, 0]) and torch.equal(y[:, R + 1 :], x[:, R + 1 :]),
+    )
+
+    # Nearly collapsed registers (shared direction + tiny residuals): stays
+    # finite, differentiable, and much more orthogonal than the input.
+    shared = torch.randn(B, 1, D) * 5.0
+    x2 = torch.randn(B, 1 + R + P, D)
+    x2[:, 1 : R + 1] = shared + 0.01 * torch.randn(B, R, D)
+    x2.requires_grad_(True)
+    y2 = model._orthogonalize_registers(x2)
+    y2[:, 1 : R + 1].pow(2).sum().backward()
+    cos_in = off_diag_cos(x2[:, 1 : R + 1].detach())
+    cos_out = off_diag_cos(y2[:, 1 : R + 1].detach())
+    check(
+        "orth: collapsed registers de-correlated without NaNs",
+        torch.isfinite(y2).all() and torch.isfinite(x2.grad).all() and cos_out < 0.5 * cos_in,
+    )
+
+    # Full forward path applies it: prenorm registers of the last block output
+    # are mutually orthogonal.
+    out = model.forward_features(torch.randn(2, 3, 32, 32))
+    prenorm_reg = out["x_prenorm"][:, 1 : R + 1]
+    check("orth: forward_features output registers orthogonal", off_diag_cos(prenorm_reg) < 1e-2)
+
+
 def test_diagnostics():
     from dinov3.eval.register_tokens.diagnostics import compute_register_diagnostics, make_fixed_views
 
@@ -246,6 +297,7 @@ def main():
     test_consistency_loss()
     test_slot_start_layer()
     test_register_budget_gate()
+    test_register_orthogonalization()
     test_diagnostics()
     test_viz_panels()
     if not all(PASSED):

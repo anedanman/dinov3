@@ -119,6 +119,9 @@ student:
   register_budget_gate: false  # learnable per-head, per-layer multiplier on the separate register budget (init 1 = ungated); requires patch_cls_attn_type=separate_register_budget
   register_init: learned  # "learned" fixed register params, or "gaussian" sampled from shared Xavier-initialized mean/log-std params.
   register_gaussian_std_init: 0.02  # legacy compatibility field; gaussian init mirrors masked_ocl and does not use this value.
+  register_orthogonalize: false  # symmetric (Loewdin) orthogonalization of register tokens after every block: Y = (XX^T + eps I)^{-1/2} X
+  register_orth_eps: 1.0e-04  # ridge added to the register Gram matrix before the inverse square root
+  register_orth_preserve_norm: true  # rescale each orthogonalized register back to its pre-orthogonalization norm
   mask_k_bias: false
   untie_cls_and_patch_norms: false  # If true, use separate norms for CLS/reg and patch/mask tokens
   untie_global_and_local_cls_norm: false  # If true, use separate norms for local and global crop CLS token during training

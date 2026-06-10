@@ -54,6 +54,9 @@ def _vit_kwargs_from_cfg(cfg):
         register_budget_gate=s.get("register_budget_gate", False),
         register_init=s.get("register_init", "learned"),
         register_gaussian_std_init=s.get("register_gaussian_std_init", 0.02),
+        register_orthogonalize=s.get("register_orthogonalize", False),
+        register_orth_eps=s.get("register_orth_eps", 1e-4),
+        register_orth_preserve_norm=s.get("register_orth_preserve_norm", True),
     )
 
 

@@ -109,6 +109,9 @@ class DinoVisionTransformer(nn.Module):
         register_budget_gate: bool = False,
         register_init: str = "learned",
         register_gaussian_std_init: float = 0.02,
+        register_orthogonalize: bool = False,
+        register_orth_eps: float = 1e-4,
+        register_orth_preserve_norm: bool = True,
         device: Any | None = None,
         **ignored_kwargs,
     ):
@@ -185,6 +188,18 @@ class DinoVisionTransformer(nn.Module):
         self.patch_cls_attn_type = patch_cls_attn_type
         self.slot_start_layer = slot_start_layer
         self.register_budget_gate = register_budget_gate
+        assert not register_orthogonalize or n_storage_tokens > 1, (
+            "register_orthogonalize requires at least 2 register tokens"
+        )
+        assert register_orth_eps > 0, "register_orth_eps must be positive"
+        self.register_orthogonalize = register_orthogonalize
+        self.register_orth_eps = register_orth_eps
+        self.register_orth_preserve_norm = register_orth_preserve_norm
+        if register_orthogonalize:
+            logger.info(
+                "using symmetric register orthogonalization after every block "
+                f"(eps={register_orth_eps}, preserve_norm={register_orth_preserve_norm})"
+            )
 
         if register_attn_type == "slot":
             assert n_storage_tokens > 0, "register_attn_type='slot' requires n_storage_tokens > 0"
@@ -318,6 +333,36 @@ class DinoVisionTransformer(nn.Module):
 
         return x, (H, W)
 
+    def _orthogonalize_registers(self, x: Tensor) -> Tensor:
+        """Symmetric (Loewdin) orthogonalization of the register tokens.
+
+        Y = (X X^T + eps I)^{-1/2} X applied per image to the R register rows,
+        making them mutually orthogonal while staying as close as possible to
+        the originals (in Frobenius norm). The inverse square root is computed
+        with coupled Newton-Schulz iterations: pure matmuls, so it stays
+        differentiable and stable even when the registers are nearly collinear
+        (eigh backward blows up on degenerate spectra).
+        """
+        R = self.n_storage_tokens
+        reg = x[:, 1 : R + 1]
+        orig_dtype = reg.dtype
+        r32 = reg.float()
+        eye = torch.eye(R, device=r32.device, dtype=torch.float32).expand(r32.shape[0], R, R)
+        gram = r32 @ r32.transpose(-1, -2) + self.register_orth_eps * eye
+        # Trace upper-bounds the top eigenvalue (PSD), so gram_n has spectrum in (0, 1]
+        # and the Newton-Schulz iteration converges.
+        scale = gram.diagonal(dim1=-2, dim2=-1).sum(-1)[:, None, None]
+        gram_n = gram / scale
+        y, z = gram_n, eye
+        for _ in range(12):
+            t = 0.5 * (3.0 * eye - z @ y)
+            y = y @ t
+            z = t @ z
+        out = (z / scale.sqrt()) @ r32  # z ~ gram_n^{-1/2}
+        if self.register_orth_preserve_norm:
+            out = out * (r32.norm(dim=-1, keepdim=True) / out.norm(dim=-1, keepdim=True).clamp_min(1e-6))
+        return torch.cat([x[:, :1], out.to(orig_dtype), x[:, R + 1 :]], dim=1)
+
     def forward_features_list(self, x_list: List[Tensor], masks_list: List[Tensor]) -> List[Dict[str, Tensor]]:
         x = []
         rope = []
@@ -331,6 +376,8 @@ class DinoVisionTransformer(nn.Module):
             else:
                 rope_sincos = [None for r in rope]
             x = blk(x, rope_sincos)
+            if self.register_orthogonalize:
+                x = [self._orthogonalize_registers(t) for t in x]
         all_x = x
         output = []
         for idx, (x, masks) in enumerate(zip(all_x, masks_list)):
@@ -376,6 +423,8 @@ class DinoVisionTransformer(nn.Module):
             else:
                 rope_sincos = None
             x = blk(x, rope_sincos)
+            if self.register_orthogonalize:
+                x = self._orthogonalize_registers(x)
             if i in blocks_to_take:
                 output.append(x)
         assert len(output) == len(blocks_to_take), f"only {len(output)} / {len(blocks_to_take)} blocks found"
@@ -484,6 +533,8 @@ class DinoVisionTransformer(nn.Module):
                 if i == last_needed:
                     break
             x = blk(x, rope)
+            if self.register_orthogonalize:
+                x = self._orthogonalize_registers(x)
         assert seen_layers == target_layers, f"only collected layers {seen_layers}, expected {target_layers}"
         out: Dict[str, Any] = {"spatial_size": (H, W), "layers": seen_layers}
         for direction in directions:

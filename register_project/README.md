@@ -167,6 +167,17 @@ Outputs (checkpoints, logs, `config.yaml`) land in `runs/<name>/`.
   extraction (viz/MBO/diagnostics) uses the per-layer convention automatically.
   `train_slot4_late.sh` starts the competition at layer 6 (of 12).
 
+**Symmetric register orthogonalization** — `student.register_orthogonalize`
+- After every block, the R register tokens are re-projected per image with
+  Loewdin symmetric orthogonalization `Y = (XX^T + eps I)^{-1/2} X`
+  (`register_orth_eps`, default 1e-4) — the closest set of mutually orthogonal
+  vectors to the originals. Computed with Newton-Schulz iterations (matmuls
+  only: differentiable and stable for nearly collinear registers, where eigh
+  backward is not). `register_orth_preserve_norm` (default true) rescales each
+  register back to its pre-projection norm so only directions are constrained.
+  Directly prevents the register collapse onto a shared direction observed in
+  slot2/slot3. Enable with `student.register_orthogonalize=true`.
+
 **Learnable register-budget gate** — `student.register_budget_gate`
 - Per-head, per-layer multiplier on the separate register budget:
   `out = out_nonreg + g * out_reg`, `g` init 1 (exactly ungated at init), no
