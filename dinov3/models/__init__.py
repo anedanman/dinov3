@@ -63,7 +63,7 @@ def build_model(args, only_teacher=False, img_size=224, device=None):
             register_init=getattr(args, "register_init", "learned"),
             register_gaussian_std_init=getattr(args, "register_gaussian_std_init", 0.02),
             register_orthogonalize=getattr(args, "register_orthogonalize", False),
-            register_orth_eps=getattr(args, "register_orth_eps", 1e-3),
+            register_orth_eps=getattr(args, "register_orth_eps", 1e-5),
             register_orth_preserve_norm=getattr(args, "register_orth_preserve_norm", True),
             device=device,
         )

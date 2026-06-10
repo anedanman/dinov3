@@ -110,7 +110,7 @@ class DinoVisionTransformer(nn.Module):
         register_init: str = "learned",
         register_gaussian_std_init: float = 0.02,
         register_orthogonalize: bool = False,
-        register_orth_eps: float = 1e-3,
+        register_orth_eps: float = 1e-5,
         register_orth_preserve_norm: bool = True,
         device: Any | None = None,
         **ignored_kwargs,
@@ -359,7 +359,7 @@ class DinoVisionTransformer(nn.Module):
         scale = gram.diagonal(dim1=-2, dim2=-1).sum(-1)[:, None, None]
         gram_n = gram / scale
         y, z = gram_n, eye
-        for _ in range(30):
+        for _ in range(40):
             t = 0.5 * (3.0 * eye - z @ y)
             y = y @ t
             z = t @ z
