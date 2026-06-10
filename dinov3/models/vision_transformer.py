@@ -110,7 +110,7 @@ class DinoVisionTransformer(nn.Module):
         register_init: str = "learned",
         register_gaussian_std_init: float = 0.02,
         register_orthogonalize: bool = False,
-        register_orth_eps: float = 1e-4,
+        register_orth_eps: float = 1e-3,
         register_orth_preserve_norm: bool = True,
         device: Any | None = None,
         **ignored_kwargs,
@@ -348,13 +348,18 @@ class DinoVisionTransformer(nn.Module):
         orig_dtype = reg.dtype
         r32 = reg.float()
         eye = torch.eye(R, device=r32.device, dtype=torch.float32).expand(r32.shape[0], R, R)
-        gram = r32 @ r32.transpose(-1, -2) + self.register_orth_eps * eye
+        gram = r32 @ r32.transpose(-1, -2)
+        # Relative ridge: register norms vary by orders of magnitude over
+        # training, so the regularizer must scale with the Gram diagonal.
+        diag_mean = gram.diagonal(dim1=-2, dim2=-1).mean(-1).clamp_min(1e-12)[:, None, None]
+        gram = gram + (self.register_orth_eps * diag_mean) * eye
         # Trace upper-bounds the top eigenvalue (PSD), so gram_n has spectrum in (0, 1]
-        # and the Newton-Schulz iteration converges.
+        # and the Newton-Schulz iteration converges. Small normalized eigenvalues
+        # (collapsed registers) grow only ~1.5x per iteration, hence the count.
         scale = gram.diagonal(dim1=-2, dim2=-1).sum(-1)[:, None, None]
         gram_n = gram / scale
         y, z = gram_n, eye
-        for _ in range(12):
+        for _ in range(30):
             t = 0.5 * (3.0 * eye - z @ y)
             y = y @ t
             z = t @ z
