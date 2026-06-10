@@ -47,8 +47,8 @@ def _normalize_map(m: torch.Tensor) -> np.ndarray:
     return m.cpu().numpy()
 
 
-def _heat_overlay(base: np.ndarray, m: torch.Tensor, alpha: float = 0.5, normalized: bool = False) -> np.ndarray:
-    heat = _colorize(m.clamp(0, 1).cpu().numpy() if normalized else _normalize_map(m))
+def _heat_overlay(base: np.ndarray, m: torch.Tensor, alpha: float = 0.5) -> np.ndarray:
+    heat = _colorize(_normalize_map(m))
     return ((1.0 - alpha) * base + alpha * heat).astype(np.uint8)
 
 
@@ -189,10 +189,7 @@ def _assignment_overlay(base: np.ndarray, attn: torch.Tensor, colors: np.ndarray
 
 def _render_mean_direction(base: np.ndarray, attn: torch.Tensor, cls_map: torch.Tensor, colors: np.ndarray) -> List[np.ndarray]:
     """Render per-register heatmaps, one joint mask, and one CLS map."""
-    # Normalize register heatmaps jointly (shared max) so relative register
-    # magnitudes stay comparable within the image.
-    shared = attn / (attn.max() + 1e-8)
-    reg_imgs = [_heat_overlay(base, shared[r], normalized=True) for r in range(attn.shape[0])]
+    reg_imgs = [_heat_overlay(base, attn[r]) for r in range(attn.shape[0])]
     seg_overlay = _assignment_overlay(base, attn, colors)
     cls_overlay = _heat_overlay(base, cls_map)
     return reg_imgs + [seg_overlay, cls_overlay]
