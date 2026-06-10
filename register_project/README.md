@@ -15,6 +15,13 @@ Everything is driven by a single YAML config (merged on top of
 | Slot3 | `scripts/train_slot3_xcrop.sh` | `vits-reg7-slot3-xcrop2-resid` | slot2 + cross-crop register consistency loss on mean-subtracted residuals |
 | Slot4 | `scripts/train_slot4_late.sh` | `vits-reg7-slot4-late6` | slot2 + competition only in layers 6-11 |
 | Slot5 | `scripts/train_slot5_gate.sh` | `vits-reg7-slot5-gate` | slot2 + learnable register-budget gate |
+| Slot6 | `scripts/train_slot_ablations_seq.sh` | `vits-reg7-slot6-nobudget` | slot2 without the separate register budget |
+| Slot7 | `scripts/train_slot_ablations_seq.sh` | `vits-reg7-slot7-learnedinit` | slot2 with plain learned register init (no gaussian) |
+
+`scripts/train_slot_ablations_seq.sh` runs Slot5 -> Slot6 -> Slot7 sequentially
+(256 micro-batch x 2 grad-accum, consistency loss disabled). Each stage writes
+a `SEQ_STAGE_DONE` marker on completion and is skipped on relaunch, so the
+sequence resumes mid-stage from the latest checkpoint after interruptions.
 
 Baseline uses `configs/vits_im1k_reg7_baseline.yaml`; all slot variants share
 `configs/vits_im1k_reg7_slot.yaml` plus per-script overrides. New runs use a
