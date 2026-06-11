@@ -15,7 +15,7 @@ import logging
 
 import torch
 
-from .attention_viz import load_coco_viz_images, load_viz_images, render_register_attention
+from .attention_viz import load_coco_viz_images, load_viz_images, render_patch_pca, render_register_attention
 from .backbone import build_eval_backbone, sync_eval_backbone
 from .diagnostics import RegisterDiagnostics
 from .mbo import compute_coco_mbo
@@ -81,9 +81,15 @@ class RegisterEvaluator:
             self._viz_display,
             layer=self.cfg.register_viz.layer,
         )
+        if self.cfg.register_viz.get("patch_pca", True):
+            out["patch_pca"] = render_patch_pca(self._backbone(), self._viz_images, self._viz_display)
         if self.cfg.register_viz.get("coco", True):
             self._ensure_coco_viz_images()
             if self._coco_viz_images is not None:
+                if self.cfg.register_viz.get("patch_pca", True):
+                    out["patch_pca_coco"] = render_patch_pca(
+                        self._backbone(), self._coco_viz_images, self._coco_viz_display
+                    )
                 specs = [
                     ("last", int(self.cfg.register_viz.get("layer", -1)), "select", "mean"),
                     ("penultimate", -2, "select", "mean"),

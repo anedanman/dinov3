@@ -210,6 +210,57 @@ def _render_per_head_direction(
     return head_masks + cls_maps
 
 
+def _pca_rgb(feats: torch.Tensor, h: int, w: int, size: int) -> np.ndarray:
+    """[P,D] patch features (already centered/projected basis applied) -> [size,size,3] uint8."""
+    lo = torch.quantile(feats, 0.01, dim=0)
+    hi = torch.quantile(feats, 0.99, dim=0)
+    rgb = ((feats - lo) / (hi - lo + 1e-8)).clamp(0, 1)
+    rgb = rgb.reshape(h, w, 3).permute(2, 0, 1)[None]
+    rgb = F.interpolate(rgb, size=(size, size), mode="nearest")[0]
+    return (rgb.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+
+
+@torch.no_grad()
+def render_patch_pca(
+    eval_backbone,
+    images: torch.Tensor,
+    display: List[np.ndarray],
+    device: str = "cuda",
+) -> List[np.ndarray]:
+    """Classic DINO feature visualization: top-3 PCA components of last-layer
+    patch features rendered as RGB.
+
+    Panels per image: [input | joint PCA | per-image PCA]. The joint variant
+    fits PCA over all patches of the batch so colors are comparable across
+    images; the per-image variant maximizes contrast within each image.
+    """
+    images = images.to(device)
+    S = images.shape[-1]
+    feats = eval_backbone.forward_features(images)["x_norm_patchtokens"].float()  # [N,P,D]
+    N, P, D = feats.shape
+    h = w = S // eval_backbone.patch_size
+
+    # Joint PCA across the whole batch.
+    X = feats.reshape(N * P, D)
+    X = X - X.mean(dim=0, keepdim=True)
+    _, _, V = torch.pca_lowrank(X, q=min(6, D))
+    joint = (X @ V[:, :3]).reshape(N, P, 3)
+
+    labels = ["input", "", "pca joint", "pca per-img"]
+    widths = [S, 4, S, S]
+    panels = [_label_strip(labels, widths)]
+    for i in range(N):
+        Xi = feats[i] - feats[i].mean(dim=0, keepdim=True)
+        _, _, Vi = torch.pca_lowrank(Xi, q=min(6, D))
+        per_img = Xi @ Vi[:, :3]
+        strip = np.concatenate(
+            [display[i], _separator(S), _pca_rgb(joint[i], h, w, S), _pca_rgb(per_img, h, w, S)],
+            axis=1,
+        )
+        panels.append(strip)
+    return panels
+
+
 @torch.no_grad()
 def render_register_attention(
     eval_backbone,
