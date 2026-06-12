@@ -59,7 +59,7 @@ evaluation:
     enabled: true
     knn:
       enabled: true
-      period_steps: 10000
+      period_steps: 25000
       train_dataset: ImageNetPacked:split=TRAIN:root=/capstor/scratch/cscs/fbombass/datasets/imagenet1k_packed
       val_dataset: ImageNetPacked:split=VAL:root=/capstor/scratch/cscs/fbombass/datasets/imagenet1k_packed
       image_size: 256
@@ -105,7 +105,7 @@ register_diagnostics:
 
 register_viz:
   enabled: true
-  every_n_steps: 10000
+  every_n_steps: 25000
   num_images: 16
   coco_num_images: 6
   layer: -1
@@ -124,7 +124,7 @@ diffcut:
 
 mbo:
   enabled: true
-  every_n_steps: 10000
+  every_n_steps: 25000
   coco_root: /capstor/scratch/cscs/fbombass/datasets/coco
   split: val2017
   max_images: 2000
