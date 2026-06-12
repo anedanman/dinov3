@@ -274,15 +274,16 @@ def render_patch_pca(
     """Classic DINO feature visualization: top-3 PCA components of last-layer
     patch features rendered as RGB.
 
-    Columns per image: [input | joint PCA | joint fg | per-img PCA | per-img fg].
-    The joint variants fit PCA over all patches of the batch so colors are
-    comparable across images; per-image variants maximize contrast within each
-    image. The "fg" columns follow DINOv2 Fig. 9: patches with a negative
-    first-component score are treated as background (rendered black) and a
-    second PCA is fit on the remaining foreground patches only.
+    Images run left to right; each image is a vertical stack of rows
+    [input / joint PCA / joint fg / per-img PCA / per-img fg], with row labels
+    on the left edge. The joint variants fit PCA over all patches of the batch
+    so colors are comparable across images; per-image variants maximize
+    contrast within each image. The "fg" rows follow DINOv2 Fig. 9: patches
+    with a negative first-component score are treated as background (rendered
+    black) and a second PCA is fit on the remaining foreground patches only.
 
-    ``per_panel_header=True`` attaches the column-label header to every strip
-    (for logging strips as individual images instead of one stacked grid).
+    Returns a single panel, or — with ``per_panel_header=True`` — one labelled
+    column per image (for logging images individually instead of one grid).
     """
     S = images.shape[-1]
     feats = []
@@ -305,27 +306,29 @@ def render_patch_pca(
     fg = (pc1 > 0).reshape(-1)
     joint_fg_rgb = _fg_pca_rgb(X, fg, q).reshape(N, P, 3)
 
-    labels = ["input", "", "pca joint", "joint fg"]
-    widths = [S, 4, S, S]
+    labels = ["input", "pca joint", "joint fg"]
     if include_per_image:
         labels += ["pca per-img", "per-img fg"]
-        widths += [S, S]
-    header = _label_strip(labels, widths)
+    # Rotate the label strip clockwise into a left-edge column of row labels.
+    label_col = np.rot90(_label_strip(labels, [S] * len(labels)), k=3).copy()
 
-    panels = [] if per_panel_header else [header]
+    columns = []
     for i in range(N):
-        columns = [display[i], _separator(S), _rgb_panel(joint_rgb[i], h, w, S), _rgb_panel(joint_fg_rgb[i], h, w, S)]
+        rows = [display[i], _rgb_panel(joint_rgb[i], h, w, S), _rgb_panel(joint_fg_rgb[i], h, w, S)]
         if include_per_image:
             Xi = feats[i] - feats[i].mean(dim=0, keepdim=True)
             Vi = _fit_pca(Xi, q)
-            columns.append(_rgb_panel(_quantile_rgb(Xi @ Vi[:, :3]), h, w, S))
+            rows.append(_rgb_panel(_quantile_rgb(Xi @ Vi[:, :3]), h, w, S))
             pc1_i = _orient_pc1((Xi @ Vi[:, 0]).reshape(1, P), h, w)
-            columns.append(_rgb_panel(_fg_pca_rgb(Xi, (pc1_i > 0).reshape(-1), q), h, w, S))
-        strip = np.concatenate(columns, axis=1)
-        if per_panel_header:
-            strip = np.concatenate([header, strip], axis=0)
-        panels.append(strip)
-    return panels
+            rows.append(_rgb_panel(_fg_pca_rgb(Xi, (pc1_i > 0).reshape(-1), q), h, w, S))
+        columns.append(np.concatenate(rows, axis=0))
+
+    if per_panel_header:
+        return [np.concatenate([label_col, c], axis=1) for c in columns]
+    grid = [label_col]
+    for c in columns:
+        grid.extend([_separator(c.shape[0]), c])
+    return [np.concatenate(grid, axis=1)]
 
 
 @torch.no_grad()
