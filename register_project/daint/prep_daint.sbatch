@@ -25,10 +25,23 @@ echo "=== [2/4] ImageNet parquet download ==="
 if [ -f "$B/datasets/imagenet1k_packed/train.bin" ]; then
     echo "packed train.bin already present — skipping download"
 else
-    python "$REPO/register_project/tools/download_imagenet1k.py" \
-        --output-dir "$B/datasets/imagenet-1k" \
-        --allow 'data/train-*' --allow 'data/validation-*' \
-        --token-file "$B/.hf_token"
+    # snapshot_download resumes completed files; retry through transient
+    # connection drops (HF closes long-lived connections occasionally).
+    ok=0
+    for attempt in $(seq 1 12); do
+        if python "$REPO/register_project/tools/download_imagenet1k.py" \
+            --output-dir "$B/datasets/imagenet-1k" \
+            --allow 'data/train-*' --allow 'data/validation-*' \
+            --token-file "$B/.hf_token"; then
+            ok=1; break
+        fi
+        echo "[download] attempt $attempt failed; retrying in 30s"
+        sleep 30
+    done
+    if [ "$ok" != "1" ]; then
+        echo "[download] giving up after 12 attempts" >&2
+        exit 1
+    fi
 fi
 
 echo "=== [3/4] build packed ImageNet ==="
