@@ -6,6 +6,7 @@
 import argparse
 import copy
 import gc
+from datetime import timedelta
 import logging
 import math
 import os
@@ -867,7 +868,13 @@ def main(argv=None):
         logger.info("setup_multidistillation done")
         assert cfg.MODEL.META_ARCHITECTURE == "MultiDistillationMetaArch"
     else:
-        setup_job(output_dir=args.output_dir, seed=args.seed)
+        # Rank-0-only evals (simple/viz/mbo/diffcut) keep the other ranks waiting in a
+        # pending collective; the NCCL default 10-min timeout SIGABRTs the job mid-eval.
+        setup_job(
+            output_dir=args.output_dir,
+            seed=args.seed,
+            distributed_timeout=timedelta(minutes=int(os.environ.get("DINOV3_NCCL_TIMEOUT_MIN", "240"))),
+        )
         cfg = setup_config(args, strict_cfg=False)
         cfg = normalize_step_schedule(cfg)
         logger.info(cfg)

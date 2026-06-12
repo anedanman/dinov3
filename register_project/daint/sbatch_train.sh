@@ -38,6 +38,10 @@ export DINOV3_PACKED_MMAP_INDEX=1
 export DINOV3_PACKED_DROP_CACHE=0   # GH200 nodes have plenty of host RAM
 export DINOV3_WANDB_MAX_IMAGE_PIXELS=90000000
 export OMP_NUM_THREADS=8
+# Milestone evals run on rank 0 only and can exceed NCCL's default watchdog
+# windows; without these the other ranks SIGABRT ~10 min into every 25k eval.
+export DINOV3_NCCL_TIMEOUT_MIN=240
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=14400
 
 source "$VENV/bin/activate"
 mkdir -p "$OUT"
