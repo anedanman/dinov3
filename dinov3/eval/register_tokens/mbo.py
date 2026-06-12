@@ -31,7 +31,15 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
+import dinov3.distributed as distributed
+
 logger = logging.getLogger("dinov3")
+
+
+def _rank_world() -> Tuple[int, int]:
+    if distributed.is_enabled():
+        return distributed.get_rank(), distributed.get_world_size()
+    return 0, 1
 
 
 def _eval_transform(size, mean, std):
@@ -135,6 +143,9 @@ def compute_coco_mbo(
     img_ids = sorted(coco.getImgIds())
     if mcfg.max_images is not None:
         img_ids = img_ids[: mcfg.max_images]
+    # Collective: shard images across ranks, overlaps are gathered at the end.
+    rank, world = _rank_world()
+    img_ids = img_ids[rank::world]
 
     inst_overlaps: List[float] = []
     sem_overlaps: List[float] = []
@@ -211,6 +222,16 @@ def compute_coco_mbo(
         if len(batch_imgs) >= batch_size:
             flush()
     flush()
+
+    if world > 1:
+        payload = {"inst": inst_overlaps, "sem": sem_overlaps, "var": variant_overlaps, "n": n_used}
+        shards: List[Optional[dict]] = [None] * world
+        torch.distributed.all_gather_object(shards, payload)
+        inst_overlaps = [v for s in shards for v in s["inst"]]
+        sem_overlaps = [v for s in shards for v in s["sem"]]
+        for key in variant_overlaps:
+            variant_overlaps[key] = [v for s in shards for v in s["var"][key]]
+        n_used = sum(s["n"] for s in shards)
 
     out: Dict[str, float] = {"mbo_n_images": float(n_used)}
     if mcfg.instance and inst_overlaps:

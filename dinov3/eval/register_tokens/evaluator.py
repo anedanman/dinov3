@@ -7,8 +7,9 @@
 
 Owns a plain eval backbone (synced from the EMA teacher before each run), a fixed
 set of visualization images, and runs the register-attention visualization and
-COCO MBO evaluation on a step schedule. Designed to be called from the main
-training loop on the main process only.
+COCO MBO evaluation on a step schedule. sync/run_mbo/run_diffcut are collective
+(images sharded across ranks; all ranks must call); viz/diagnostics are
+main-process-only.
 """
 
 import logging

@@ -53,6 +53,35 @@ def _default_val_dataset(dataset_path: str) -> str:
     return path
 
 
+def _rank_world() -> tuple[int, int]:
+    if distributed.is_enabled():
+        return distributed.get_rank(), distributed.get_world_size()
+    return 0, 1
+
+
+def _shard_dataset(dataset: Dataset) -> Dataset:
+    """Strided per-rank shard so the backbone forward passes parallelize over GPUs."""
+    rank, world = _rank_world()
+    if world == 1:
+        return dataset
+    return Subset(dataset, list(range(rank, len(dataset), world)))
+
+
+def _gather_cat(x: torch.Tensor | None) -> torch.Tensor | None:
+    """Concatenate per-rank CPU tensors across ranks (None marks an empty shard).
+
+    Collective: every rank must call this the same number of times in the same
+    order. Returns the full concatenation on all ranks.
+    """
+    _, world = _rank_world()
+    if world == 1:
+        return x
+    shards: list[torch.Tensor | None] = [None] * world
+    torch.distributed.all_gather_object(shards, x)
+    present = [s for s in shards if s is not None]
+    return torch.cat(present, dim=0) if present else None
+
+
 def _subset(dataset: Dataset, max_images: int | None, seed: int) -> Dataset:
     if max_images is None or max_images <= 0 or max_images >= len(dataset):
         return dataset
@@ -86,7 +115,7 @@ def _extract_cls_features(
     device: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     loader = DataLoader(
-        dataset,
+        _shard_dataset(dataset),
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
@@ -100,7 +129,9 @@ def _extract_cls_features(
         out = backbone(images, is_training=True)
         features.append(out["x_norm_clstoken"].float().cpu())
         labels.append(torch.as_tensor(targets, dtype=torch.long).cpu())
-    return torch.cat(features, dim=0), torch.cat(labels, dim=0)
+    features = _gather_cat(torch.cat(features, dim=0) if features else None)
+    labels = _gather_cat(torch.cat(labels, dim=0) if labels else None)
+    return features, labels
 
 
 @torch.no_grad()
@@ -113,7 +144,7 @@ def _extract_cls_and_avg_register_features(
     device: str,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     loader = DataLoader(
-        dataset,
+        _shard_dataset(dataset),
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
@@ -133,8 +164,16 @@ def _extract_cls_and_avg_register_features(
         elif has_register_features:
             avg_register_features.append(storage_tokens.float().mean(dim=1).cpu())
         labels.append(torch.as_tensor(targets, dtype=torch.long).cpu())
-    avg_register = torch.cat(avg_register_features, dim=0) if has_register_features else None
-    return torch.cat(cls_features, dim=0), avg_register, torch.cat(labels, dim=0)
+    cls = _gather_cat(torch.cat(cls_features, dim=0) if cls_features else None)
+    avg_register = _gather_cat(
+        torch.cat(avg_register_features, dim=0) if has_register_features and avg_register_features else None
+    )
+    label_out = _gather_cat(torch.cat(labels, dim=0) if labels else None)
+    # Registers are a model property: ranks agree, except that an empty shard
+    # contributes None — only trust avg_register if it covers every image.
+    if avg_register is not None and cls is not None and avg_register.shape[0] != cls.shape[0]:
+        avg_register = None
+    return cls, avg_register, label_out
 
 
 def _accuracy(logits: torch.Tensor, labels: torch.Tensor, topk=(1, 5)) -> dict[str, float]:
@@ -307,42 +346,44 @@ def _run_coco_linear_segmentation(
         seed=int(scfg.seed) + 1,
     )
     num_classes = train_dataset.num_classes
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=int(scfg.batch_size),
-        shuffle=False,  # features are cached once; epoch shuffling happens on the cache
-        num_workers=int(scfg.num_workers),
-        pin_memory=False,  # avoid growing the never-freed pinned-host cache for occasional evals
-        drop_last=False,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=int(scfg.batch_size),
-        shuffle=False,
-        num_workers=int(scfg.num_workers),
-        pin_memory=False,  # avoid growing the never-freed pinned-host cache for occasional evals
-        drop_last=False,
-    )
     backbone.eval()
-    # Extract patch features once (fp16 cache on device); epochs then only
-    # train the linear head, so epoch count is decoupled from backbone cost.
-    feats: list[torch.Tensor] = []
-    flat_labels: list[torch.Tensor] = []
-    with torch.no_grad():
-        for images, labels in train_loader:
+
+    # Extract patch features once (fp16 cache); epochs then only train the
+    # linear head, so epoch count is decoupled from backbone cost. Extraction
+    # is sharded across ranks (the expensive part); the gathered caches are
+    # identical on all ranks, so the head probe is just replicated everywhere
+    # and rank 0's metrics get logged — no idle ranks, no extra collectives.
+    @torch.no_grad()
+    def extract(dataset: Dataset) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        loader = DataLoader(
+            _shard_dataset(dataset),
+            batch_size=int(scfg.batch_size),
+            shuffle=False,  # features are cached once; epoch shuffling happens on the cache
+            num_workers=int(scfg.num_workers),
+            pin_memory=False,  # avoid growing the never-freed pinned-host cache for occasional evals
+            drop_last=False,
+        )
+        feats: list[torch.Tensor] = []
+        flat_labels: list[torch.Tensor] = []
+        for images, labels in loader:
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             out = backbone(images, is_training=True)
             patches = out["x_norm_patchtokens"]
             grid = int(round(patches.shape[1] ** 0.5))
             patch_labels = F.interpolate(labels[:, None].float(), size=(grid, grid), mode="nearest")[:, 0].long()
-            feats.append(patches.reshape(-1, patches.shape[-1]).half())
-            flat_labels.append(patch_labels.reshape(-1))
-    if not feats:
+            feats.append(patches.reshape(-1, patches.shape[-1]).half().cpu())
+            flat_labels.append(patch_labels.reshape(-1).cpu())
+        X = _gather_cat(torch.cat(feats) if feats else None)
+        y = _gather_cat(torch.cat(flat_labels) if flat_labels else None)
+        return X, y
+
+    X, y = extract(train_dataset)
+    val_X, val_y = extract(val_dataset)
+    if X is None or val_X is None:
         return {}
-    X = torch.cat(feats)
-    y = torch.cat(flat_labels)
-    del feats, flat_labels
+    X = X.to(device)
+    y = y.to(device)
 
     head = nn.Linear(X.shape[1], num_classes).to(device)
     optimizer = torch.optim.AdamW(head.parameters(), lr=float(scfg.lr), weight_decay=float(scfg.weight_decay))
@@ -361,15 +402,11 @@ def _run_coco_linear_segmentation(
     del X, y
     confusion = torch.zeros(num_classes, num_classes, dtype=torch.int64, device=device)
     with torch.no_grad():
-        for images, labels in val_loader:
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-            out = backbone(images, is_training=True)
-            patches = out["x_norm_patchtokens"].float()
-            grid = int(round(patches.shape[1] ** 0.5))
-            patch_labels = F.interpolate(labels[:, None].float(), size=(grid, grid), mode="nearest")[:, 0].long()
-            pred = head(patches).argmax(dim=-1).reshape(images.shape[0], grid, grid)
-            idx = patch_labels.reshape(-1) * num_classes + pred.reshape(-1)
+        for start in range(0, val_X.shape[0], probe_batch_size):
+            patches = val_X[start : start + probe_batch_size].to(device).float()
+            patch_labels = val_y[start : start + probe_batch_size].to(device)
+            pred = head(patches).argmax(dim=-1)
+            idx = patch_labels * num_classes + pred
             confusion += torch.bincount(idx, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
     return _segmentation_metrics(confusion.cpu())
 
@@ -428,7 +465,9 @@ class SimplePeriodicEvaluator:
         sync_eval_backbone(self._backbone(), model.model_ema["backbone"])
 
     def run(self, step: int, due: _Due) -> dict[str, float]:
-        if not distributed.is_main_process() or not due.any:
+        # Collective: feature extraction is sharded across all ranks, so every
+        # rank must enter (the cheap probes are replicated; rank 0 logs).
+        if not due.any:
             return {}
         metrics: dict[str, float] = {}
         backbone = self._backbone()

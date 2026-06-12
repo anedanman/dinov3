@@ -35,7 +35,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from .mbo import _best_overlaps, _eval_transform, _resize_gt
+from .mbo import _best_overlaps, _eval_transform, _rank_world, _resize_gt
 
 logger = logging.getLogger("dinov3")
 
@@ -164,6 +164,10 @@ def compute_coco_diffcut(eval_backbone, cfg, device: str = "cuda") -> Dict[str, 
 
     coco = COCO(ann_path)
     img_ids = sorted(coco.getImgIds())[: int(dcfg.max_images)]
+    # Collective: shard images across ranks; per-resolution overlap lists are
+    # gathered after each resolution pass (all ranks share the resolution loop).
+    rank, world = _rank_world()
+    img_ids = img_ids[rank::world]
     tau = float(dcfg.tau)
     alpha = float(dcfg.alpha)
     max_nodes = int(dcfg.get("max_graph_nodes", 1024))
@@ -224,6 +228,15 @@ def compute_coco_diffcut(eval_backbone, cfg, device: str = "cuda") -> Dict[str, 
             if len(batch_imgs) >= batch_size:
                 flush()
         flush()
+
+        if world > 1:
+            payload = {"inst": inst_overlaps, "sem": sem_overlaps, "nseg": n_segments, "n": n_used}
+            shards: List[dict | None] = [None] * world
+            torch.distributed.all_gather_object(shards, payload)
+            inst_overlaps = [v for s in shards for v in s["inst"]]
+            sem_overlaps = [v for s in shards for v in s["sem"]]
+            n_segments = [v for s in shards for v in s["nseg"]]
+            n_used = sum(s["n"] for s in shards)
 
         if inst_overlaps:
             out[f"r{size}_mbo_instance"] = float(np.mean(inst_overlaps))

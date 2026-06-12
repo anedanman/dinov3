@@ -529,42 +529,43 @@ def do_train(cfg, model, resume=False):
         _synchronize_cuda()
         try:
             register_evaluator.sync(model)  # collective (full_tensor); all ranks must call
-            if distributed.is_main_process():
-                if run_viz:
-                    viz_outputs = None
-                    try:
-                        viz_outputs = register_evaluator.run_viz()
-                        if isinstance(viz_outputs, dict):
-                            for key, panels in viz_outputs.items():
-                                wandb_logger.log_images(wandb_run, panels, step=step, key=key)
-                        else:
-                            wandb_logger.log_images(wandb_run, viz_outputs, step=step, key="register_attention")
-                    except Exception as e:
-                        logger.warning(f"register viz failed: {e}")
-                    finally:
-                        if isinstance(viz_outputs, dict):
-                            viz_outputs.clear()
-                        del viz_outputs
-                if run_mbo:
-                    mbo_metrics = None
-                    try:
-                        mbo_metrics = register_evaluator.run_mbo()
+            if run_viz and distributed.is_main_process():
+                viz_outputs = None
+                try:
+                    viz_outputs = register_evaluator.run_viz()
+                    if isinstance(viz_outputs, dict):
+                        for key, panels in viz_outputs.items():
+                            wandb_logger.log_images(wandb_run, panels, step=step, key=key)
+                    else:
+                        wandb_logger.log_images(wandb_run, viz_outputs, step=step, key="register_attention")
+                except Exception as e:
+                    logger.warning(f"register viz failed: {e}")
+                finally:
+                    if isinstance(viz_outputs, dict):
+                        viz_outputs.clear()
+                    del viz_outputs
+            if run_mbo:
+                mbo_metrics = None
+                try:
+                    mbo_metrics = register_evaluator.run_mbo()  # collective: images sharded across ranks
+                    if distributed.is_main_process():
                         wandb_logger.log_scalars(wandb_run, _format_mbo_metrics_for_wandb(mbo_metrics), step=step)
-                    except Exception as e:
-                        logger.warning(f"MBO eval failed: {e}")
-                    finally:
-                        del mbo_metrics
-                if run_diffcut:
-                    try:
-                        diffcut_metrics = register_evaluator.run_diffcut()
+                except Exception as e:
+                    logger.warning(f"MBO eval failed: {e}")
+                finally:
+                    del mbo_metrics
+            if run_diffcut:
+                try:
+                    diffcut_metrics = register_evaluator.run_diffcut()  # collective: images sharded across ranks
+                    if distributed.is_main_process():
                         wandb_logger.log_scalars(
                             wandb_run, {f"diffcut/{k}": v for k, v in diffcut_metrics.items()}, step=step
                         )
                         diffcut_panels = register_evaluator.run_diffcut_viz()
                         if diffcut_panels:
                             wandb_logger.log_images(wandb_run, diffcut_panels, step=step, key="diffcut_seg")
-                    except Exception as e:
-                        logger.warning(f"DiffCut eval failed: {e}")
+                except Exception as e:
+                    logger.warning(f"DiffCut eval failed: {e}")
         finally:
             model.train()
             _synchronize_cuda()
