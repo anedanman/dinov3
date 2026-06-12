@@ -534,7 +534,9 @@ def do_train(cfg, model, resume=False):
                         viz_outputs = register_evaluator.run_viz()
                         if isinstance(viz_outputs, dict):
                             for key, panels in viz_outputs.items():
-                                wandb_logger.log_images(wandb_run, panels, step=step, key=key)
+                                wandb_logger.log_images(
+                                    wandb_run, panels, step=step, key=key, stack=not key.endswith("_hires")
+                                )
                         else:
                             wandb_logger.log_images(wandb_run, viz_outputs, step=step, key="register_attention")
                     except Exception as e:

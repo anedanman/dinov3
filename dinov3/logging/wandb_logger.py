@@ -51,28 +51,41 @@ def log_scalars(run, metrics: dict, step: int):
     run.log({k: v for k, v in metrics.items()}, step=step)
 
 
-def log_images(run, panels, step: int, key: str = "register_attention", caption=None):
-    """Stack a list of HxWx3 uint8 numpy arrays vertically and log as one image."""
+def _to_capped_image(arr):
+    """HxWx3 uint8 array -> PIL image, downscaled to the wandb pixel cap."""
+    from PIL import Image
+
+    max_pixels = int(os.environ.get("DINOV3_WANDB_MAX_IMAGE_PIXELS", "4000000"))
+    image = Image.fromarray(arr)
+    if max_pixels > 0 and arr.shape[0] * arr.shape[1] > max_pixels:
+        scale = math.sqrt(max_pixels / float(arr.shape[0] * arr.shape[1]))
+        resampling = getattr(Image, "Resampling", Image).BILINEAR
+        image = image.resize(
+            (max(1, int(arr.shape[1] * scale)), max(1, int(arr.shape[0] * scale))),
+            resampling,
+        )
+    return image
+
+
+def log_images(run, panels, step: int, key: str = "register_attention", caption=None, stack: bool = True):
+    """Log a list of HxWx3 uint8 numpy arrays.
+
+    ``stack=True`` concatenates panels vertically into one image (then applies
+    the pixel cap to the whole grid). ``stack=False`` logs each panel as its
+    own image under the same key, so the cap applies per panel — use this for
+    high-resolution panels that would be crushed by downscaling a stacked grid.
+    """
     if run is None or not panels:
         return
     import numpy as np
-    from PIL import Image
     import wandb
 
-    grid = np.concatenate(panels, axis=0)  # stack panels vertically -> single image
-    max_pixels = int(os.environ.get("DINOV3_WANDB_MAX_IMAGE_PIXELS", "4000000"))
-    image = Image.fromarray(grid)
-    if max_pixels > 0 and grid.shape[0] * grid.shape[1] > max_pixels:
-        scale = math.sqrt(max_pixels / float(grid.shape[0] * grid.shape[1]))
-        resampling = getattr(Image, "Resampling", Image).BILINEAR
-        image = image.resize(
-            (max(1, int(grid.shape[1] * scale)), max(1, int(grid.shape[0] * scale))),
-            resampling,
-        )
-    if caption is None:
-        caption = f"{len(panels)} images"
-    run.log({key: wandb.Image(image, caption=caption)}, step=step)
-    image.close()
+    if stack:
+        grid = np.concatenate(panels, axis=0)
+        images = [wandb.Image(_to_capped_image(grid), caption=caption or f"{len(panels)} images")]
+    else:
+        images = [wandb.Image(_to_capped_image(p), caption=f"{caption or key} {i}") for i, p in enumerate(panels)]
+    run.log({key: images if len(images) > 1 else images[0]}, step=step)
 
 
 def finish(run):

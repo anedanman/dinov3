@@ -34,6 +34,10 @@ class RegisterEvaluator:
         self._eval_backbone = None
         self._viz_images = None
         self._viz_display = None
+        self._pca_images = None
+        self._pca_display = None
+        self._pca_hires_images = None
+        self._pca_hires_display = None
         self._coco_viz_images = None
         self._coco_viz_display = None
         self._coco_viz_attempted = False
@@ -46,6 +50,22 @@ class RegisterEvaluator:
     def _ensure_viz_images(self):
         if self._viz_images is None:
             self._viz_images, self._viz_display = load_viz_images(self.cfg, self.cfg.register_viz.num_images)
+
+    def _ensure_pca_viz_images(self):
+        if self._pca_images is not None:
+            return
+        n = int(self.cfg.register_viz.get("patch_pca_num_images", 24) or 0)
+        n = n or self.cfg.register_viz.num_images
+        self._pca_images, self._pca_display = load_viz_images(self.cfg, n)
+        hires_size = int(self.cfg.register_viz.get("patch_pca_hires_size", 1024) or 0)
+        n_hires = int(self.cfg.register_viz.get("patch_pca_hires_num_images", 8) or 0)
+        if hires_size > 0 and n_hires > 0:
+            # Load the same deterministic image set at high resolution, then
+            # subsample evenly so hires panels stay a subset of the lowres set.
+            imgs, disp = load_viz_images(self.cfg, n, image_size=hires_size)
+            step = max(1, n // min(n_hires, n))
+            self._pca_hires_images = imgs[::step][:n_hires]
+            self._pca_hires_display = disp[::step][:n_hires]
 
     def _ensure_coco_viz_images(self):
         if self._coco_viz_attempted:
@@ -82,7 +102,17 @@ class RegisterEvaluator:
             layer=self.cfg.register_viz.layer,
         )
         if self.cfg.register_viz.get("patch_pca", True):
-            out["patch_pca"] = render_patch_pca(self._backbone(), self._viz_images, self._viz_display)
+            self._ensure_pca_viz_images()
+            out["patch_pca"] = render_patch_pca(self._backbone(), self._pca_images, self._pca_display)
+            if self._pca_hires_images is not None:
+                out["patch_pca_hires"] = render_patch_pca(
+                    self._backbone(),
+                    self._pca_hires_images,
+                    self._pca_hires_display,
+                    include_per_image=False,
+                    max_forward_batch=4,
+                    per_panel_header=True,
+                )
         if self.cfg.register_viz.get("coco", True):
             self._ensure_coco_viz_images()
             if self._coco_viz_images is not None:

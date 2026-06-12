@@ -294,6 +294,10 @@ register_viz:
   image_size: 224
   coco: true                # also render COCO validation panels for MBO variants
   coco_num_images: null     # null = reuse num_images
+  patch_pca: true                 # PCA-RGB patch-feature panels (joint, bg-removed, per-image)
+  patch_pca_num_images: 24        # dedicated (larger) image set for the PCA panels
+  patch_pca_hires_size: 1024      # same image set at this resolution, logged unstacked (0 = off)
+  patch_pca_hires_num_images: 8   # how many of the PCA images to render at high resolution
 
 mbo:
   enabled: false

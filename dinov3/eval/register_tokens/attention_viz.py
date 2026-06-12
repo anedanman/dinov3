@@ -210,14 +210,55 @@ def _render_per_head_direction(
     return head_masks + cls_maps
 
 
-def _pca_rgb(feats: torch.Tensor, h: int, w: int, size: int) -> np.ndarray:
-    """[P,D] patch features (already centered/projected basis applied) -> [size,size,3] uint8."""
-    lo = torch.quantile(feats, 0.01, dim=0)
-    hi = torch.quantile(feats, 0.99, dim=0)
-    rgb = ((feats - lo) / (hi - lo + 1e-8)).clamp(0, 1)
-    rgb = rgb.reshape(h, w, 3).permute(2, 0, 1)[None]
-    rgb = F.interpolate(rgb, size=(size, size), mode="nearest")[0]
-    return (rgb.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+def _fit_pca(X: torch.Tensor, q: int) -> torch.Tensor:
+    """[M,D] centered features -> [D,q] principal directions."""
+    _, _, V = torch.pca_lowrank(X, q=q)
+    return V
+
+
+def _quantile_rgb(proj: torch.Tensor) -> torch.Tensor:
+    """[M,3] PCA projections -> [M,3] in [0,1], per-channel 1/99-percentile min-max."""
+    lo = torch.quantile(proj, 0.01, dim=0)
+    hi = torch.quantile(proj, 0.99, dim=0)
+    return ((proj - lo) / (hi - lo + 1e-8)).clamp(0, 1)
+
+
+def _rgb_panel(rgb: torch.Tensor, h: int, w: int, size: int) -> np.ndarray:
+    """[P,3] patch colors in [0,1] -> [size,size,3] uint8 (nearest upsample)."""
+    img = rgb.reshape(h, w, 3).permute(2, 0, 1)[None]
+    img = F.interpolate(img, size=(size, size), mode="nearest")[0]
+    return (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+
+
+def _orient_pc1(pc1: torch.Tensor, h: int, w: int) -> torch.Tensor:
+    """Flip PC1 sign so border patches (mostly background) score negative.
+
+    pca_lowrank's component signs are arbitrary; the paper's fg/bg split
+    (fg = positive PC1) only works with a consistent orientation.
+    pc1: [N,P] with P == h*w.
+    """
+    border = torch.zeros(h, w, dtype=torch.bool, device=pc1.device)
+    border[[0, -1], :] = True
+    border[:, [0, -1]] = True
+    border = border.reshape(-1)
+    if pc1[..., border].mean() > pc1[..., ~border].mean():
+        pc1 = -pc1
+    return pc1
+
+
+def _fg_pca_rgb(X: torch.Tensor, fg: torch.Tensor, q: int) -> torch.Tensor:
+    """Second-stage PCA on foreground patches only (DINOv2 Fig. 9 recipe).
+
+    X: [M,D] centered features, fg: [M] bool. Returns [M,3] in [0,1] with
+    background rows left black.
+    """
+    rgb = torch.zeros(X.shape[0], 3, device=X.device)
+    if int(fg.sum()) > q:
+        Xf = X[fg]
+        Xf = Xf - Xf.mean(dim=0, keepdim=True)
+        Vf = _fit_pca(Xf, q)
+        rgb[fg] = _quantile_rgb(Xf @ Vf[:, :3])
+    return rgb
 
 
 @torch.no_grad()
@@ -226,37 +267,63 @@ def render_patch_pca(
     images: torch.Tensor,
     display: List[np.ndarray],
     device: str = "cuda",
+    include_per_image: bool = True,
+    max_forward_batch: int = 16,
+    per_panel_header: bool = False,
 ) -> List[np.ndarray]:
     """Classic DINO feature visualization: top-3 PCA components of last-layer
     patch features rendered as RGB.
 
-    Panels per image: [input | joint PCA | per-image PCA]. The joint variant
-    fits PCA over all patches of the batch so colors are comparable across
-    images; the per-image variant maximizes contrast within each image.
+    Columns per image: [input | joint PCA | joint fg | per-img PCA | per-img fg].
+    The joint variants fit PCA over all patches of the batch so colors are
+    comparable across images; per-image variants maximize contrast within each
+    image. The "fg" columns follow DINOv2 Fig. 9: patches with a negative
+    first-component score are treated as background (rendered black) and a
+    second PCA is fit on the remaining foreground patches only.
+
+    ``per_panel_header=True`` attaches the column-label header to every strip
+    (for logging strips as individual images instead of one stacked grid).
     """
-    images = images.to(device)
     S = images.shape[-1]
-    feats = eval_backbone.forward_features(images)["x_norm_patchtokens"].float()  # [N,P,D]
+    feats = []
+    for i in range(0, images.shape[0], max_forward_batch):
+        chunk = images[i : i + max_forward_batch].to(device)
+        feats.append(eval_backbone.forward_features(chunk)["x_norm_patchtokens"].float())
+    feats = torch.cat(feats, dim=0)  # [N,P,D]
     N, P, D = feats.shape
     h = w = S // eval_backbone.patch_size
+    q = min(6, D)
 
-    # Joint PCA across the whole batch.
+    # Stage 1: joint PCA across all patches of the batch.
     X = feats.reshape(N * P, D)
     X = X - X.mean(dim=0, keepdim=True)
-    _, _, V = torch.pca_lowrank(X, q=min(6, D))
-    joint = (X @ V[:, :3]).reshape(N, P, 3)
+    V = _fit_pca(X, q)
+    joint_rgb = _quantile_rgb(X @ V[:, :3]).reshape(N, P, 3)
 
-    labels = ["input", "", "pca joint", "pca per-img"]
+    # Stage 2: fg/bg split on PC1, second PCA on foreground patches only.
+    pc1 = _orient_pc1((X @ V[:, 0]).reshape(N, P), h, w)
+    fg = (pc1 > 0).reshape(-1)
+    joint_fg_rgb = _fg_pca_rgb(X, fg, q).reshape(N, P, 3)
+
+    labels = ["input", "", "pca joint", "joint fg"]
     widths = [S, 4, S, S]
-    panels = [_label_strip(labels, widths)]
+    if include_per_image:
+        labels += ["pca per-img", "per-img fg"]
+        widths += [S, S]
+    header = _label_strip(labels, widths)
+
+    panels = [] if per_panel_header else [header]
     for i in range(N):
-        Xi = feats[i] - feats[i].mean(dim=0, keepdim=True)
-        _, _, Vi = torch.pca_lowrank(Xi, q=min(6, D))
-        per_img = Xi @ Vi[:, :3]
-        strip = np.concatenate(
-            [display[i], _separator(S), _pca_rgb(joint[i], h, w, S), _pca_rgb(per_img, h, w, S)],
-            axis=1,
-        )
+        columns = [display[i], _separator(S), _rgb_panel(joint_rgb[i], h, w, S), _rgb_panel(joint_fg_rgb[i], h, w, S)]
+        if include_per_image:
+            Xi = feats[i] - feats[i].mean(dim=0, keepdim=True)
+            Vi = _fit_pca(Xi, q)
+            columns.append(_rgb_panel(_quantile_rgb(Xi @ Vi[:, :3]), h, w, S))
+            pc1_i = _orient_pc1((Xi @ Vi[:, 0]).reshape(1, P), h, w)
+            columns.append(_rgb_panel(_fg_pca_rgb(Xi, (pc1_i > 0).reshape(-1), q), h, w, S))
+        strip = np.concatenate(columns, axis=1)
+        if per_panel_header:
+            strip = np.concatenate([header, strip], axis=0)
         panels.append(strip)
     return panels
 
