@@ -18,7 +18,7 @@ import torch
 from .attention_viz import load_coco_viz_images, load_viz_images, render_patch_pca, render_register_attention
 from .backbone import build_eval_backbone, sync_eval_backbone
 from .diagnostics import RegisterDiagnostics
-from .diffcut import compute_coco_diffcut
+from .diffcut import compute_coco_diffcut, render_diffcut_viz
 from .mbo import compute_coco_mbo
 
 logger = logging.getLogger("dinov3")
@@ -145,6 +145,10 @@ class RegisterEvaluator:
     @torch.no_grad()
     def run_diffcut(self):
         return compute_coco_diffcut(self._backbone(), self.cfg)
+
+    @torch.no_grad()
+    def run_diffcut_viz(self):
+        return render_diffcut_viz(self._backbone(), self.cfg)
 
     @torch.no_grad()
     def run_diagnostics(self):

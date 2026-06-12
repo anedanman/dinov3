@@ -235,3 +235,60 @@ def compute_coco_diffcut(eval_backbone, cfg, device: str = "cuda") -> Dict[str, 
 
     logger.info(f"[DiffCut] {out}")
     return out
+
+
+@torch.no_grad()
+def render_diffcut_viz(eval_backbone, cfg, device: str = "cuda") -> List[np.ndarray]:
+    """Panels of DiffCut segmentations on a fixed COCO image set.
+
+    Images run left to right; rows are [input | one segmentation row per
+    resolution], each segment drawn in a distinct color blended over the input.
+    """
+    import glob
+
+    from .attention_viz import _distinct_colors, _label_strip, _separator
+
+    dcfg = cfg.diffcut
+    n = int(dcfg.get("viz_num_images", 10))
+    disp = int(dcfg.get("viz_display_size", 512))
+    img_dir = os.path.join(os.path.expanduser(dcfg.coco_root), dcfg.split)
+    paths = sorted(glob.glob(os.path.join(img_dir, "*.jpg")))[:n]
+    if not paths:
+        logger.warning(f"No COCO images found under {img_dir}; skipping DiffCut viz.")
+        return []
+    pil_imgs = [Image.open(p).convert("RGB") for p in paths]
+    display = [np.asarray(im.resize((disp, disp), Image.BILINEAR), dtype=np.uint8) for im in pil_imgs]
+
+    resolutions = [int(s) for s in dcfg.resolutions]
+    tau = float(dcfg.tau)
+    alpha = float(dcfg.alpha)
+    max_nodes = int(dcfg.get("max_graph_nodes", 1024))
+    patch_size = eval_backbone.patch_size
+
+    seg_rows = {}
+    for size in resolutions:
+        transform = _eval_transform(size, cfg.crops.rgb_mean, cfg.crops.rgb_std)
+        batch = torch.stack([transform(im) for im in pil_imgs])
+        bs = max(1, int(dcfg.get("batch_size", 16)) * (256 // size) ** 2)
+        feats = torch.cat(
+            [
+                eval_backbone.forward_features(batch[i : i + bs].to(device))["x_norm_patchtokens"]
+                for i in range(0, len(pil_imgs), bs)
+            ]
+        )
+        grid = size // patch_size
+        rows = []
+        for i in range(len(pil_imgs)):
+            labels = diffcut_labels(feats[i], (grid, grid), disp, tau, alpha, max_nodes)
+            colors = _distinct_colors(int(labels.max()) + 1)
+            seg = colors[labels.cpu().numpy()]
+            rows.append((0.45 * display[i] + 0.55 * seg).astype(np.uint8))
+        seg_rows[size] = rows
+
+    row_labels = ["input"] + [f"ncut {size}px" for size in resolutions]
+    label_col = np.rot90(_label_strip(row_labels, [disp] * len(row_labels)), k=3).copy()
+    grid_cols = [label_col]
+    for i in range(len(pil_imgs)):
+        col = np.concatenate([display[i]] + [seg_rows[size][i] for size in resolutions], axis=0)
+        grid_cols.extend([_separator(col.shape[0]), col])
+    return [np.concatenate(grid_cols, axis=1)]

@@ -310,6 +310,8 @@ diffcut:
   alpha: 10                 # affinity sharpening exponent on min-max-normalized cosine similarity
   max_graph_nodes: 1024     # avg-pool the NCut graph down to at most this many patches
   batch_size: 16            # feature-extraction batch at 256px (scaled down at higher resolutions)
+  viz_num_images: 10        # fixed COCO images rendered as colored segmentation panels
+  viz_display_size: 512     # display resolution of the segmentation panels
 
 mbo:
   enabled: false

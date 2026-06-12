@@ -559,6 +559,9 @@ def do_train(cfg, model, resume=False):
                         wandb_logger.log_scalars(
                             wandb_run, {f"diffcut/{k}": v for k, v in diffcut_metrics.items()}, step=step
                         )
+                        diffcut_panels = register_evaluator.run_diffcut_viz()
+                        if diffcut_panels:
+                            wandb_logger.log_images(wandb_run, diffcut_panels, step=step, key="diffcut_seg")
                     except Exception as e:
                         logger.warning(f"DiffCut eval failed: {e}")
         finally:
