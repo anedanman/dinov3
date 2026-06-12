@@ -269,7 +269,6 @@ def render_patch_pca(
     device: str = "cuda",
     include_per_image: bool = True,
     max_forward_batch: int = 16,
-    per_panel_header: bool = False,
 ) -> List[np.ndarray]:
     """Classic DINO feature visualization: top-3 PCA components of last-layer
     patch features rendered as RGB.
@@ -282,8 +281,7 @@ def render_patch_pca(
     with a negative first-component score are treated as background (rendered
     black) and a second PCA is fit on the remaining foreground patches only.
 
-    Returns a single panel, or — with ``per_panel_header=True`` — one labelled
-    column per image (for logging images individually instead of one grid).
+    Returns a single-panel list (one concatenated grid).
     """
     S = images.shape[-1]
     feats = []
@@ -323,8 +321,6 @@ def render_patch_pca(
             rows.append(_rgb_panel(_fg_pca_rgb(Xi, (pc1_i > 0).reshape(-1), q), h, w, S))
         columns.append(np.concatenate(rows, axis=0))
 
-    if per_panel_header:
-        return [np.concatenate([label_col, c], axis=1) for c in columns]
     grid = [label_col]
     for c in columns:
         grid.extend([_separator(c.shape[0]), c])
