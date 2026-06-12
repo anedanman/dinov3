@@ -88,6 +88,19 @@ def log_images(run, panels, step: int, key: str = "register_attention", caption=
     run.log({key: images if len(images) > 1 else images[0]}, step=step)
 
 
+def log_checkpoint_artifact(run, ckpt_path, step: int):
+    """Upload a milestone checkpoint directory as a wandb artifact (async upload)."""
+    if run is None:
+        return
+    import wandb
+
+    name = f"{run.name}-ckpt".replace("/", "-")
+    artifact = wandb.Artifact(name=name, type="checkpoint", metadata={"step": step})
+    artifact.add_dir(str(ckpt_path))
+    run.log_artifact(artifact, aliases=["latest", f"step-{step}"])
+    logger.info(f"wandb: uploading checkpoint artifact {name} step={step} from {ckpt_path}")
+
+
 def finish(run):
     if run is not None:
         run.finish()

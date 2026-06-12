@@ -842,6 +842,10 @@ def do_train(cfg, model, resume=False):
                 keep_last_n_checkpoints(ckpt_dir, cfg.checkpointing.max_to_keep)
                 if "keep_every" in cfg.checkpointing and (iteration + 1) % cfg.checkpointing.keep_every == 0:
                     keep_checkpoint_copy(ckpt_dir / str(iteration))
+                    if wandb_run is not None and cfg.checkpointing.get("wandb_upload", False):
+                        wandb_logger.log_checkpoint_artifact(
+                            wandb_run, ckpt_dir / f"{iteration}_keep", step=iteration
+                        )
 
         iteration = iteration + 1
     metric_logger.synchronize_between_processes()

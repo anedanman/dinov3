@@ -266,6 +266,7 @@ checkpointing:
   period: 3750
   max_to_keep: 3
   keep_every: 99999999999999999  # Save a checkpoint every N iterations, regardless of max_to_keep and period
+  wandb_upload: false  # upload each keep_every milestone checkpoint to wandb as an artifact
 
 # ---------------------------------------------------------------------------
 # Register-token research extensions (used by dinov3/eval/register_tokens)
