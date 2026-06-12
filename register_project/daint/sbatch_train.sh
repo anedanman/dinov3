@@ -43,7 +43,9 @@ source "$VENV/bin/activate"
 mkdir -p "$OUT"
 cd "$REPO"
 
-torchrun --nproc_per_node=4 --master_port=29501 \
+# NOTE: not `torchrun` — the container's /usr/local/bin/torchrun runs under the
+# system python, which cannot see the venv overlay's packages.
+python -m torch.distributed.run --nproc_per_node=4 --master_port=29501 \
     dinov3/train/train.py \
     --config-file "$REPO/register_project/configs/daint/${CONFIG_STEM}.yaml" \
     --output-dir "$OUT"
