@@ -258,6 +258,7 @@ evaluation:
       batch_size: 32
       num_workers: 4
       epochs: 3
+      probe_batch_size: 16384  # patches per head-training step (features are cached, epochs are cheap)
       lr: 0.001
       weight_decay: 0.0
       seed: 2

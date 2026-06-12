@@ -310,7 +310,7 @@ def _run_coco_linear_segmentation(
     train_loader = DataLoader(
         train_dataset,
         batch_size=int(scfg.batch_size),
-        shuffle=True,
+        shuffle=False,  # features are cached once; epoch shuffling happens on the cache
         num_workers=int(scfg.num_workers),
         pin_memory=False,  # avoid growing the never-freed pinned-host cache for occasional evals
         drop_last=False,
@@ -323,30 +323,42 @@ def _run_coco_linear_segmentation(
         pin_memory=False,  # avoid growing the never-freed pinned-host cache for occasional evals
         drop_last=False,
     )
-    head = None
-    optimizer = None
     backbone.eval()
-    for _ in range(int(scfg.epochs)):
+    # Extract patch features once (fp16 cache on device); epochs then only
+    # train the linear head, so epoch count is decoupled from backbone cost.
+    feats: list[torch.Tensor] = []
+    flat_labels: list[torch.Tensor] = []
+    with torch.no_grad():
         for images, labels in train_loader:
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
-            with torch.no_grad():
-                out = backbone(images, is_training=True)
-                patches = out["x_norm_patchtokens"].float()
-                grid = int(round(patches.shape[1] ** 0.5))
-                patch_labels = F.interpolate(labels[:, None].float(), size=(grid, grid), mode="nearest")[:, 0].long()
-            if head is None:
-                head = nn.Linear(patches.shape[-1], num_classes).to(device)
-                optimizer = torch.optim.AdamW(head.parameters(), lr=float(scfg.lr), weight_decay=float(scfg.weight_decay))
-            logits = head(patches).reshape(images.shape[0], grid, grid, num_classes).permute(0, 3, 1, 2)
-            loss = F.cross_entropy(logits, patch_labels)
-            assert optimizer is not None
+            out = backbone(images, is_training=True)
+            patches = out["x_norm_patchtokens"]
+            grid = int(round(patches.shape[1] ** 0.5))
+            patch_labels = F.interpolate(labels[:, None].float(), size=(grid, grid), mode="nearest")[:, 0].long()
+            feats.append(patches.reshape(-1, patches.shape[-1]).half())
+            flat_labels.append(patch_labels.reshape(-1))
+    if not feats:
+        return {}
+    X = torch.cat(feats)
+    y = torch.cat(flat_labels)
+    del feats, flat_labels
+
+    head = nn.Linear(X.shape[1], num_classes).to(device)
+    optimizer = torch.optim.AdamW(head.parameters(), lr=float(scfg.lr), weight_decay=float(scfg.weight_decay))
+    probe_batch_size = int(scfg.get("probe_batch_size", 16384))
+    generator = torch.Generator(device=device)
+    generator.manual_seed(int(scfg.seed))
+    for _ in range(int(scfg.epochs)):
+        perm = torch.randperm(X.shape[0], device=device, generator=generator)
+        for start in range(0, X.shape[0], probe_batch_size):
+            idx = perm[start : start + probe_batch_size]
+            logits = head(X[idx].float())
+            loss = F.cross_entropy(logits, y[idx])
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
-
-    if head is None:
-        return {}
+    del X, y
     confusion = torch.zeros(num_classes, num_classes, dtype=torch.int64, device=device)
     with torch.no_grad():
         for images, labels in val_loader:

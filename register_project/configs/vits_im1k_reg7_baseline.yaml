@@ -72,17 +72,26 @@ evaluation:
       full_max_val_images: null
     linear:
       enabled: true
-      period_steps: 50000
+      period_steps: 25000
       train_dataset: ImageNetPacked:split=TRAIN:root=~/datasets/imagenet1k_packed
       val_dataset: ImageNetPacked:split=VAL:root=~/datasets/imagenet1k_packed
       image_size: 256
+      max_train_images: 150000
+      max_val_images: 25000
+      batch_size: 256
+      probe_batch_size: 8192
+      epochs: 20
     coco_linear_segmentation:
       enabled: true
-      period_steps: 50000
+      period_steps: 25000
       coco_root: ~/datasets/coco
       train_split: train2017
       val_split: val2017
       image_size: 256
+      max_train_images: 8000
+      max_val_images: 2000
+      batch_size: 64
+      epochs: 10
 
 checkpointing:
   period: 2500                      # latest checkpoint every 2500 steps (~80 min of max lost work)
