@@ -18,6 +18,7 @@ import torch
 from .attention_viz import load_coco_viz_images, load_viz_images, render_patch_pca, render_register_attention
 from .backbone import build_eval_backbone, sync_eval_backbone
 from .diagnostics import RegisterDiagnostics
+from .diffcut import compute_coco_diffcut
 from .mbo import compute_coco_mbo
 
 logger = logging.getLogger("dinov3")
@@ -28,6 +29,9 @@ class RegisterEvaluator:
         self.cfg = cfg
         self.viz_enabled = cfg.register_viz.enabled and cfg.student.n_storage_tokens > 0
         self.mbo_enabled = cfg.mbo.enabled and cfg.student.n_storage_tokens > 0
+        # DiffCut runs on patch features only, so it does not require registers.
+        diffcut_cfg = cfg.get("diffcut", None)
+        self.diffcut_enabled = bool(diffcut_cfg and diffcut_cfg.enabled)
         diag_cfg = cfg.get("register_diagnostics", None)
         self.diag_enabled = bool(diag_cfg and diag_cfg.enabled and cfg.student.n_storage_tokens > 0)
         self._diagnostics = RegisterDiagnostics(cfg) if self.diag_enabled else None
@@ -76,6 +80,9 @@ class RegisterEvaluator:
 
     def should_run_mbo(self, step: int) -> bool:
         return self.mbo_enabled and (step + 1) % self.cfg.mbo.every_n_steps == 0
+
+    def should_run_diffcut(self, step: int) -> bool:
+        return self.diffcut_enabled and (step + 1) % self.cfg.diffcut.every_n_steps == 0
 
     def should_run_diagnostics(self, step: int) -> bool:
         return self.diag_enabled and (step + 1) % self.cfg.register_diagnostics.every_n_steps == 0
@@ -134,6 +141,10 @@ class RegisterEvaluator:
     @torch.no_grad()
     def run_mbo(self):
         return compute_coco_mbo(self._backbone(), self.cfg)
+
+    @torch.no_grad()
+    def run_diffcut(self):
+        return compute_coco_diffcut(self._backbone(), self.cfg)
 
     @torch.no_grad()
     def run_diagnostics(self):

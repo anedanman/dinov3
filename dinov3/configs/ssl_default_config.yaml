@@ -299,6 +299,18 @@ register_viz:
   patch_pca_num_images: 16        # dedicated image set for the PCA panels
   patch_pca_hires_size: 1024      # render the same image set again at this resolution (0 = off)
 
+diffcut:
+  enabled: false
+  every_n_steps: 25000      # DiffCut zero-shot segmentation eval cadence
+  coco_root: ~/datasets/coco
+  split: val2017
+  max_images: 100           # eigendecompositions per image make this pricier than linear probes
+  resolutions: [256, 1024]  # input resolutions; metrics are logged per resolution
+  tau: 0.5                  # recurse while the best normalized-cut value is below tau
+  alpha: 10                 # affinity sharpening exponent on min-max-normalized cosine similarity
+  max_graph_nodes: 1024     # avg-pool the NCut graph down to at most this many patches
+  batch_size: 16            # feature-extraction batch at 256px (scaled down at higher resolutions)
+
 mbo:
   enabled: false
   every_n_steps: 5000       # compute COCO MBO every N steps

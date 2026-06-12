@@ -514,15 +514,16 @@ def do_train(cfg, model, resume=False):
         )
         logger.info("Released temporary memory after %s", reason)
 
-    def _run_register_validation(step: int, run_viz: bool, run_mbo: bool, reason: str):
-        if not (run_viz or run_mbo):
+    def _run_register_validation(step: int, run_viz: bool, run_mbo: bool, reason: str, run_diffcut: bool = False):
+        if not (run_viz or run_mbo or run_diffcut):
             return
         logger.info(
-            "Running register validation at step %d (%s): viz=%s mbo=%s",
+            "Running register validation at step %d (%s): viz=%s mbo=%s diffcut=%s",
             step,
             reason,
             run_viz,
             run_mbo,
+            run_diffcut,
         )
         _synchronize_cuda()
         try:
@@ -552,6 +553,14 @@ def do_train(cfg, model, resume=False):
                         logger.warning(f"MBO eval failed: {e}")
                     finally:
                         del mbo_metrics
+                if run_diffcut:
+                    try:
+                        diffcut_metrics = register_evaluator.run_diffcut()
+                        wandb_logger.log_scalars(
+                            wandb_run, {f"diffcut/{k}": v for k, v in diffcut_metrics.items()}, step=step
+                        )
+                    except Exception as e:
+                        logger.warning(f"DiffCut eval failed: {e}")
         finally:
             model.train()
             _synchronize_cuda()
@@ -623,6 +632,7 @@ def do_train(cfg, model, resume=False):
             step=resume_step,
             run_viz=register_evaluator.viz_enabled,
             run_mbo=register_evaluator.mbo_enabled,
+            run_diffcut=register_evaluator.diffcut_enabled,
             reason="checkpoint resume",
         )
         _run_simple_validation(step=resume_step, reason="checkpoint resume")
@@ -799,8 +809,9 @@ def do_train(cfg, model, resume=False):
         # Register-token evaluation: attention visualization + COCO MBO
         run_viz = register_evaluator.should_run_viz(iteration)
         run_mbo = register_evaluator.should_run_mbo(iteration)
-        if run_viz or run_mbo:
-            _run_register_validation(iteration, run_viz, run_mbo, reason="scheduled")
+        run_diffcut = register_evaluator.should_run_diffcut(iteration)
+        if run_viz or run_mbo or run_diffcut:
+            _run_register_validation(iteration, run_viz, run_mbo, reason="scheduled", run_diffcut=run_diffcut)
 
         # Lightweight periodic KNN / linear / COCO linear segmentation probes.
         _run_simple_validation(iteration, reason="scheduled")

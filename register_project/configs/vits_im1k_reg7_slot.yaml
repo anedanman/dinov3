@@ -124,6 +124,16 @@ register_viz:
   dataset: ImageNetPacked:split=VAL:root=~/datasets/imagenet1k_packed
   image_size: 256
 
+diffcut:
+  enabled: true
+  every_n_steps: 25000
+  coco_root: ~/datasets/coco
+  split: val2017
+  max_images: 100
+  resolutions: [256, 1024]
+  tau: 0.5
+  alpha: 10
+
 mbo:
   enabled: true
   every_n_steps: 10000
