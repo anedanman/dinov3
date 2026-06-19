@@ -36,6 +36,30 @@ Weights & Biases logging, register diagnostics every 500 steps, periodic
 register-attention visualization, and **COCO MBO** (instance + semantic) at
 validation.
 
+## Supervised ViT-B classifiers
+
+`register_project/classification/` contains the matched ImageNet-1k classifier
+experiments requested for regular and slot-like registers. Both use this
+repository's ViT-B/16, four learned registers, a target batch of 256, BF16,
+AdamW, and a 300k-step cosine schedule. The only model difference is
+`register_attn_type: standard` versus `slot`; CLS/patch rows use standard
+attention in both runs.
+
+The trainer probes a real forward/backward at batch 256 before launch and uses
+gradient accumulation only if that probe runs out of memory. It logs the
+existing register diagnostics plus per-layer register attention mass, entropy,
+and peak scores every 500 steps. Image visualizations follow the DINO overlay
+convention and include pre-QKV CLS/register-to-patch cosine similarity plus
+register/CLS attention maps.
+
+```bash
+PYTHONPATH=. python -m register_project.classification.train \
+  --config register_project/classification/configs/vitb_im1k_reg4_baseline.yaml
+
+PYTHONPATH=. python -m register_project.classification.train \
+  --config register_project/classification/configs/vitb_im1k_reg4_slot.yaml
+```
+
 ---
 
 ## Quick start on a new machine
