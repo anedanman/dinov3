@@ -232,7 +232,11 @@ def test_register_orthogonalization():
 
 
 def test_diagnostics():
-    from dinov3.eval.register_tokens.diagnostics import compute_register_diagnostics, make_fixed_views
+    from dinov3.eval.register_tokens.diagnostics import (
+        attention_score_metrics,
+        compute_register_diagnostics,
+        make_fixed_views,
+    )
 
     model = _tiny_vit(
         register_attn_type="slot",
@@ -272,10 +276,20 @@ def test_diagnostics():
         and -1.0 <= metrics["register_diag/xcrop_matched_cos"] <= 1.0
         and abs(metrics["register_gate/mean"] - 1.0) < 1e-6,
     )
+    attention_metrics = attention_score_metrics(model, images)
+    check(
+        "diagnostics: layerwise attention scores present",
+        len(attention_metrics) == model.n_blocks * 4
+        and "register_attention/layer_00/register_to_patch_entropy" in attention_metrics,
+    )
+    check("diagnostics: attention scores finite", all(np.isfinite(v) for v in attention_metrics.values()))
 
 
 def test_viz_panels():
-    from dinov3.eval.register_tokens.attention_viz import render_register_attention
+    from dinov3.eval.register_tokens.attention_viz import (
+        render_register_attention,
+        render_register_embedding_similarity,
+    )
 
     model = _tiny_vit(register_attn_type="slot", patch_cls_attn_type="separate_register_budget")
     N, S = 2, 32
@@ -291,6 +305,22 @@ def test_viz_panels():
     )
     per_head = render_register_attention(model, images, display, device="cpu", head_reduce="none")
     check("viz: per-head layout renders", len(per_head) == N + 1 and per_head[0].shape[1] == per_head[1].shape[1])
+
+    similarity = model.get_register_patch_embedding_similarity(images, layer=-1)
+    register_similarity, cls_similarity = model.get_prefix_patch_embedding_similarity(images, layer=-1)
+    check(
+        "embedding similarity: expected shape and cosine range",
+        similarity.shape == (N, R, S // model.patch_size, S // model.patch_size)
+        and register_similarity.shape == similarity.shape
+        and cls_similarity.shape == (N, S // model.patch_size, S // model.patch_size)
+        and similarity.min() >= -1.0001
+        and similarity.max() <= 1.0001,
+    )
+    sim_panels = render_register_embedding_similarity(model, images, display, device="cpu")
+    check(
+        "embedding similarity: input plus one panel per register",
+        len(sim_panels) == N + 1 and all(p.shape[1] == (R + 2) * S for p in sim_panels),
+    )
 
 
 def main():

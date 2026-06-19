@@ -160,6 +160,35 @@ def gate_metrics(backbone) -> Dict[str, float]:
 
 
 @torch.no_grad()
+def attention_score_metrics(backbone, images: Tensor) -> Dict[str, float]:
+    """Per-layer scalar summaries of register attention scores.
+
+    The summaries retain the attention convention used by each model: standard
+    key-softmax for regular registers and register competition for slot-like
+    registers. This makes it possible to follow both experiments with the same
+    dashboard while preserving their actual forward-pass semantics.
+    """
+    collection = backbone.get_register_attention_layers(
+        images,
+        directions=("register_to_patch", "patch_to_register"),
+    )
+    metrics = {}
+    r2p = collection["register_to_patch"]["masks"].float()  # [L,B,H,R,P]
+    p2r = collection["patch_to_register"]["masks"].float()  # [L,B,H,R,P]
+    for pos, layer in enumerate(collection["layers"]):
+        register_patch_mass = r2p[pos].sum(dim=-1)
+        register_patch_dist = r2p[pos] / register_patch_mass.unsqueeze(-1).clamp_min(_EPS)
+        register_patch_entropy = _entropy(register_patch_dist, dim=-1) / math.log(r2p.shape[-1])
+        patch_register_mass = p2r[pos].sum(dim=-2)
+        prefix = f"register_attention/layer_{layer:02d}"
+        metrics[f"{prefix}/register_to_patch_mass"] = register_patch_mass.mean().item()
+        metrics[f"{prefix}/register_to_patch_entropy"] = register_patch_entropy.mean().item()
+        metrics[f"{prefix}/register_to_patch_peak"] = register_patch_dist.max(dim=-1).values.mean().item()
+        metrics[f"{prefix}/patch_to_register_mass"] = patch_register_mass.mean().item()
+    return metrics
+
+
+@torch.no_grad()
 def compute_register_diagnostics(
     backbone,
     images: Tensor,

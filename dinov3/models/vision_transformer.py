@@ -552,6 +552,46 @@ class DinoVisionTransformer(nn.Module):
         return out
 
     @torch.no_grad()
+    def get_prefix_patch_embedding_similarity(self, x: Tensor, layer: int = -1) -> Tuple[Tensor, Tensor]:
+        """Cosine similarity from CLS/register embeddings to patches before QKV.
+
+        The embeddings are taken after the block's pre-attention normalization
+        (``norm1``), which is the exact tensor passed to the QKV projection.
+
+        Returns:
+            ``(register_similarity, cls_similarity)`` shaped ``[B,R,H,W]``
+            and ``[B,H,W]``, respectively, with values in ``[-1, 1]``.
+        """
+        assert self.n_storage_tokens > 0, "no register tokens to visualize"
+        target_layer = int(layer) % self.n_blocks
+        x, (H, W) = self.prepare_tokens_with_masks(x)
+        for i, blk in enumerate(self.blocks):
+            rope = self.rope_embed(H=H, W=W) if self.rope_embed is not None else None
+            if i == target_layer:
+                qkv_input = blk.norm1(x).float()
+                registers = torch.nn.functional.normalize(
+                    qkv_input[:, 1 : 1 + self.n_storage_tokens], dim=-1
+                )
+                cls = torch.nn.functional.normalize(qkv_input[:, :1], dim=-1)
+                patches = torch.nn.functional.normalize(qkv_input[:, 1 + self.n_storage_tokens :], dim=-1)
+                register_similarity = torch.einsum("brd,bpd->brp", registers, patches)
+                cls_similarity = torch.einsum("bcd,bpd->bcp", cls, patches)[:, 0]
+                return (
+                    register_similarity.reshape(x.shape[0], self.n_storage_tokens, H, W),
+                    cls_similarity.reshape(x.shape[0], H, W),
+                )
+            x = blk(x, rope)
+            if self.register_orthogonalize:
+                x = self._orthogonalize_registers(x)
+        raise AssertionError(f"layer {target_layer} was not reached")
+
+    @torch.no_grad()
+    def get_register_patch_embedding_similarity(self, x: Tensor, layer: int = -1) -> Tensor:
+        """Compatibility wrapper returning pre-QKV register-to-patch cosine maps."""
+        register_similarity, _ = self.get_prefix_patch_embedding_similarity(x, layer=layer)
+        return register_similarity
+
+    @torch.no_grad()
     def get_register_attention_maps(
         self,
         x: Tensor,
@@ -619,6 +659,12 @@ class DinoVisionTransformer(nn.Module):
         ret = self.forward_features(*args, **kwargs)
         if is_training:
             return ret
+        if getattr(self, "classifier_pooling", "cls") == "global_avg_all":
+            tokens = [ret["x_norm_clstoken"].unsqueeze(1)]
+            if ret["x_storage_tokens"].numel() > 0:
+                tokens.append(ret["x_storage_tokens"])
+            tokens.append(ret["x_norm_patchtokens"])
+            return self.head(torch.cat(tokens, dim=1).mean(dim=1))
         else:
             return self.head(ret["x_norm_clstoken"])
 

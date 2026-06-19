@@ -407,3 +407,36 @@ def render_register_attention(
         strip = np.concatenate(columns, axis=1)
         panels.append(strip)
     return panels
+
+
+@torch.no_grad()
+def render_register_embedding_similarity(
+    eval_backbone,
+    images: torch.Tensor,
+    display: List[np.ndarray],
+    layer: int = -1,
+    device: str = "cuda",
+) -> List[np.ndarray]:
+    """Render pre-QKV CLS/register-to-patch cosine-similarity maps.
+
+    Each image row is ``[input | CLS cosine | reg0 cosine | ...]``. As in the
+    DINO attention visualizer, every map is normalized independently before
+    overlaying it on the input. This exposes spatial structure even when the
+    absolute cosine range is narrow early in training.
+    """
+    images = images.to(device)
+    size = images.shape[-1]
+    similarity, cls_similarity = eval_backbone.get_prefix_patch_embedding_similarity(images, layer=layer)
+    similarity = F.interpolate(similarity, size=(size, size), mode="bilinear", align_corners=False)
+    cls_similarity = F.interpolate(
+        cls_similarity[:, None], size=(size, size), mode="bilinear", align_corners=False
+    )[:, 0]
+
+    labels = ["input", "CLS cosine"] + [f"reg{r} cosine" for r in range(eval_backbone.n_storage_tokens)]
+    widths = [size] * len(labels)
+    panels = [_label_strip(labels, widths)]
+    for i, base in enumerate(display):
+        columns = [base, _heat_overlay(base, cls_similarity[i])]
+        columns.extend(_heat_overlay(base, reg_map) for reg_map in similarity[i])
+        panels.append(np.concatenate(columns, axis=1))
+    return panels
