@@ -1,0 +1,146 @@
+# ===========================================================================
+# DINOv3 ViT-S/16 pretraining on ImageNet-1k  --  SLOT-REGISTER variant
+#
+# Identical to vits_im1k_reg7_baseline.yaml EXCEPT the register tokens use
+# slot-attention-style competition:
+#   * registers never attend to other registers (incl. themselves),
+#   * register->(cls+patch) logits are softmaxed across the register/query
+#     dimension (competition), then key-renormalized (slot_mode=slot).
+# In this config, CLS/patch tokens use `patch_cls_attn_type:
+# separate_register_budget`, so they attend to CLS+patch keys and register keys
+# with independent softmax budgets. Set it back to `standard` to make all
+# non-register tokens behave exactly as in the baseline.
+#
+# Merged on top of dinov3/configs/ssl_default_config.yaml.
+# Launch:  register_project/scripts/train_slot.sh
+# ===========================================================================
+MODEL:
+  META_ARCHITECTURE: SSLMetaArch
+
+train:
+  # Effective batch 512 = 128 micro-batch x 4 grad-accum steps (single 95GB GPU, 31GB host RAM).
+  # Keep the micro-batch conservative because the hosts are RAM-constrained.
+  batch_size_per_gpu: 128
+  grad_accum_steps: 4
+  dataset_path: ImageNetPacked:split=TRAIN:root=~/datasets/imagenet1k_packed
+  num_workers: 12
+  pin_memory: true
+  prefetch_factor: 2
+  persistent_workers: true
+  dataloader_multiprocessing_context: forkserver
+  normalize_on_gpu: true            # uint8 crops from workers, normalize on GPU (4x less host-RAM batch traffic)
+  compile: true
+  OFFICIAL_EPOCH_LENGTH: 1          # overwritten by the step-based schedule normalizer
+  wandb:
+    enabled: true
+    project: dinov3-registers
+    name: vits-reg7-slot
+    tags: [vits, reg7, slot, slot-attn]
+    log_freq: 10
+
+student:
+  arch: vit_small
+  patch_size: 16
+  drop_path_rate: 0.1
+  layerscale: 1.0e-05
+  n_storage_tokens: 7               # 7 register / slot tokens
+  register_attn_type: slot          # <-- slot-register competition attention
+  slot_mode: slot                   # "slot" (key-renormalized weighted mean) or "literal"
+  register_attn_exclude_cls: true   # registers compete over patch tokens only
+  patch_cls_attn_type: separate_register_budget  # CLS/patch get separate cls+patch and register attention budgets
+  register_init: learned            # "gaussian" samples registers from shared Xavier-initialized mean/log-std
+  register_gaussian_std_init: 0.02  # legacy compatibility field; ignored by masked_ocl-style init
+
+# DINOv3 default crop resolution (256 global / 112 local).
+crops:
+  global_crops_size: 256            # 16x16 = 256 patch tokens
+  local_crops_size: 112             # 7x7 = 49 patch tokens
+
+schedule:
+  enabled: true
+  total_steps: 200000
+  warmup_steps: 10000
+  freeze_last_layer_steps: 1000
+  teacher_temp_warmup_steps: 30000
+
+optim:
+  scaling_rule: sqrt_wrt_1024
+
+evaluation:
+  eval_period_iterations: 0
+  simple:
+    enabled: true
+    knn:
+      enabled: true
+      period_steps: 10000
+      train_dataset: ImageNetPacked:split=TRAIN:root=~/datasets/imagenet1k_packed
+      val_dataset: ImageNetPacked:split=VAL:root=~/datasets/imagenet1k_packed
+      image_size: 256
+      full_at_end: true
+      full_max_train_images: null
+      full_max_val_images: null
+    linear:
+      enabled: true
+      period_steps: 25000
+      train_dataset: ImageNetPacked:split=TRAIN:root=~/datasets/imagenet1k_packed
+      val_dataset: ImageNetPacked:split=VAL:root=~/datasets/imagenet1k_packed
+      image_size: 256
+      max_train_images: 150000
+      max_val_images: 25000
+      batch_size: 256
+      probe_batch_size: 8192
+      epochs: 20
+    coco_linear_segmentation:
+      enabled: true
+      period_steps: 25000
+      coco_root: ~/datasets/coco
+      train_split: train2017
+      val_split: val2017
+      image_size: 256
+      max_train_images: 8000
+      max_val_images: 2000
+      batch_size: 64
+      epochs: 10
+
+checkpointing:
+  period: 2500                      # latest checkpoint every 2500 steps (~80 min of max lost work)
+  max_to_keep: 3
+  keep_every: 25000                 # milestone checkpoints kept forever (training-dynamics analysis / probing)
+
+register_diagnostics:
+  enabled: true                     # cheap scalar diagnostics: slot usage, outlier tokens, cross-crop agreement, gates
+  every_n_steps: 500
+  num_images: 32
+  image_size: 256
+  outlier_ratio: 2.0
+  crop_pairs: true
+
+register_viz:
+  enabled: true
+  every_n_steps: 10000
+  num_images: 16
+  coco_num_images: 6
+  layer: -1
+  dataset: ImageNetPacked:split=VAL:root=~/datasets/imagenet1k_packed
+  image_size: 256
+
+diffcut:
+  enabled: true
+  every_n_steps: 25000
+  coco_root: ~/datasets/coco
+  split: val2017
+  max_images: 1000
+  resolutions: [256, 1024]
+  tau: 0.5
+  alpha: 10
+
+mbo:
+  enabled: true
+  every_n_steps: 10000
+  coco_root: ~/datasets/coco
+  split: val2017
+  max_images: 2000
+  layer: -1
+  image_size: 256
+  instance: true
+  semantic: true

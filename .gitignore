@@ -8,8 +8,13 @@ dist/
 
 **/notebooks
 
-# Ignore shell scripts
+# Ignore shell scripts (but keep the register-tokens project scripts)
 *.sh
+!register_project/**/*.sh
+
+# Training outputs / experiment logs
+runs/
+wandb/
 
 # Ignore swap files
 *.swp

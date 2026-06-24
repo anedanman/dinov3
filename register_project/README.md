@@ -1,0 +1,325 @@
+# Register tokens as object-centric representations (DINOv3)
+
+Research scaffolding around DINOv3 to study **register/storage tokens as
+object-centric representations**, plus an alternative **slot-register attention**
+mechanism.
+
+Everything is driven by a single YAML config (merged on top of
+`dinov3/configs/ssl_default_config.yaml`). Two ready-to-run experiments:
+
+| Experiment | Script | wandb name | Delta |
+|---|---|---|---|
+| Baseline | `scripts/train_baseline.sh` | `vits-reg7-baseline` | standard self-attention |
+| Slot | `scripts/train_slot.sh` | `vits-reg7-slot` | slot competition |
+| Slot2 | `scripts/train_slot2.sh` | `vits-reg7-slot2` | + separate register budget + gaussian init |
+| Slot3 | `scripts/train_slot3_xcrop.sh` | `vits-reg7-slot3-xcrop2-resid` | slot2 + cross-crop register consistency loss on mean-subtracted residuals |
+| Slot4 | `scripts/train_slot4_late.sh` | `vits-reg7-slot4-late6` | slot2 + competition only in layers 6-11 |
+| Slot5 | `scripts/train_slot5_gate.sh` | `vits-reg7-slot5-gate` | slot2 + learnable register-budget gate |
+| Slot6 | `scripts/train_slot_ablations_seq.sh` | `vits-reg7-slot6-nobudget` | slot2 without the separate register budget |
+| Slot7 | `scripts/train_slot_ablations_seq.sh` | `vits-reg7-slot7-learnedinit` | slot2 with plain learned register init (no gaussian) |
+
+`scripts/train_slot_ablations_seq.sh` runs Slot5 -> Slot6 -> Slot7 sequentially
+(256 micro-batch x 2 grad-accum, consistency loss disabled). Each stage writes
+a `SEQ_STAGE_DONE` marker on completion and is skipped on relaunch, so the
+sequence resumes mid-stage from the latest checkpoint after interruptions.
+
+Baseline uses `configs/vits_im1k_reg7_baseline.yaml`; all slot variants share
+`configs/vits_im1k_reg7_slot.yaml` plus per-script overrides. New runs use a
+**256 micro-batch x 2 grad-accum** (same effective batch 512); the older
+`train_slot2.sh` keeps 128x4 for checkpoint continuity. All runs log register
+diagnostics every 500 steps, keep the latest checkpoint every 2500 steps plus a
+permanent milestone every 25k, and run viz + COCO MBO every 10k steps.
+
+All: **ViT-S/16 (~21.6M params)**, **7 register tokens**, **effective batch 512**
+(gradient accumulation on a single GPU), **256/112 crops**, step-based schedule,
+Weights & Biases logging, register diagnostics every 500 steps, periodic
+register-attention visualization, and **COCO MBO** (instance + semantic) at
+validation.
+
+## Supervised ViT-B classifiers
+
+`register_project/classification/` contains the matched ImageNet-1k classifier
+experiments requested for regular and slot-like registers. Both use this
+repository's ViT-B/16, four learned registers, a target batch of 256, BF16,
+AdamW, and a 300k-step cosine schedule. The only model difference is
+`register_attn_type: standard` versus `slot`; CLS/patch rows use standard
+attention in both runs.
+
+The trainer probes a real forward/backward at batch 256 before launch and uses
+gradient accumulation only if that probe runs out of memory. It logs the
+existing register diagnostics plus per-layer register attention mass, entropy,
+and peak scores every 500 steps. Image visualizations follow the DINO overlay
+convention and include pre-QKV CLS/register-to-patch cosine similarity plus
+register/CLS attention maps.
+
+```bash
+PYTHONPATH=. python -m register_project.classification.train \
+  --config register_project/classification/configs/vitb_im1k_reg4_baseline.yaml
+
+PYTHONPATH=. python -m register_project.classification.train \
+  --config register_project/classification/configs/vitb_im1k_reg4_slot.yaml
+```
+
+---
+
+## Quick start on a new machine
+
+```bash
+git clone https://github.com/anedanman/dinov3 && cd dinov3
+git checkout register-tokens
+bash register_project/scripts/setup_all.sh          # creates env + checks/builds data
+# (add ALLOW_IMAGENET_DOWNLOAD=1 with an HF token to also fetch ImageNet parquet)
+conda activate dinov3
+wandb login                                         # or set train.wandb.mode=offline
+bash register_project/scripts/train_baseline.sh     # or train_slot.sh
+```
+
+`setup_all.sh` = `setup_env.sh` (conda env + torch/cu128 + deps) then
+`prepare_data.sh` (idempotent dataset check/build). Both can be run individually.
+Key overrides (env vars): `ENV_NAME`, `TORCH_INDEX_URL`/`TORCH_VERSION`/`TORCHVISION_VERSION`
+(for non-Blackwell CUDA), `PACKED_DIR`/`PARQUET_DIR`/`COCO_DIR`.
+
+---
+
+## 0. Environment
+
+A conda env `dinov3` is already created (cloned from a Blackwell-compatible
+`torch 2.11.0+cu128` env + `torchvision 0.26.0+cu128`, plus `wandb pyarrow
+pycocotools matplotlib scipy scikit-learn omegaconf submitit fvcore ...`).
+
+```bash
+conda activate dinov3        # python 3.11, torch 2.11+cu128
+```
+
+The launch scripts set `PYTHONPATH` to the repo root, so no `pip install -e`
+is required.
+
+## 1. Data preparation
+
+### ImageNet-1k (repack parquet → memory-mappable blob)
+
+The HF parquet shards have ~100 MB row groups, which are too coarse for the
+random-access SSL sampler. We repack once into a flat blob + index:
+
+```bash
+python register_project/tools/build_packed_imagenet.py \
+    --parquet-dir ~/datasets/imagenet-1k/data \
+    --out-dir     ~/datasets/imagenet1k_packed \
+    --splits train val
+```
+
+Produces `train.bin/train_index.npy` (~156 GB) and `val.bin/val_index.npy`.
+The dataset is exposed as `ImageNetPacked:split=TRAIN:root=~/datasets/imagenet1k_packed`.
+
+### COCO val (for MBO)
+
+```bash
+python register_project/tools/download_coco_val.py --out-dir ~/datasets/coco
+# -> ~/datasets/coco/val2017/*.jpg
+# -> ~/datasets/coco/annotations/instances_val2017.json
+```
+
+## 2. Weights & Biases
+
+```bash
+wandb login          # once
+```
+Configure under `train.wandb` in the YAML (`enabled`, `project`, `name`, `mode`).
+Set `mode: offline` (or `train.wandb.enabled: false`) to run without a network.
+
+## 3. Train
+
+```bash
+# baseline (standard register attention)
+bash register_project/scripts/train_baseline.sh
+
+# slot-register variant
+bash register_project/scripts/train_slot.sh
+```
+
+Useful env vars: `OUTPUT_DIR`, `NGPUS`, `MASTER_PORT`, `ENV_PY`.
+Extra config overrides can be appended, e.g.:
+
+```bash
+bash register_project/scripts/train_slot.sh schedule.total_steps=50000 train.batch_size_per_gpu=256
+```
+
+Outputs (checkpoints, logs, `config.yaml`) land in `runs/<name>/`.
+
+---
+
+## What was added / changed
+
+**Slot-register attention** — `dinov3/layers/attention.py`
+- `RegisterSlotAttention`: registers never attend to any register; their
+  logits over patches (or cls+patches with `register_attn_exclude_cls=false`)
+  are softmaxed across the **register/query** dimension (competition).
+  `slot_mode="slot"` adds slot-attention key renormalization (weighted mean);
+  `slot_mode="literal"` uses `out = A @ V`. By default non-register tokens are
+  unchanged and may attend to registers.
+- `patch_cls_attn_type="separate_register_budget"` changes CLS/patch query rows:
+  they run one key-softmax over CLS+patch keys and a second key-softmax over
+  register keys, then add the two value averages. This gives registers an
+  independent attention budget instead of making them compete with CLS/patch
+  keys inside the same softmax.
+  Implemented with fused SDPA kernels per query-row group (CLS/patch rows and,
+  where applicable, register rows) plus explicit fp32 competition for slot
+  register rows; outputs are concatenated, so nothing is computed twice and no
+  full-attention fallback or row overwrite is needed.
+- `extract_register_attention_maps(...)`: register→patch and patch→register
+  weights for viz/MBO, plus matching CLS maps, using the configured
+  `patch_cls_attn_type`. `extract_register_patch_attention(...)` remains as the
+  register→patch compatibility wrapper.
+
+**Cross-crop register consistency loss** — `dinov3/loss/register_consistency_loss.py`
+- `register_consistency.*` config: student registers of one global crop are
+  pulled toward the teacher registers of the *other* global crop, matched per
+  image with Hungarian assignment on cosine similarity (`matching: hungarian`,
+  or `fixed` for index-aligned registers). Loss is mean `(1 - cos)` over the
+  matched pairs, with optional linear `warmup_steps` and optional
+  `include_local` (student local crops vs teacher globals).
+- `subtract_mean: true` matches mean-subtracted register residuals instead of
+  raw registers. Registers collapse onto one shared direction early in slot
+  training (`reg_pairwise_cos` ~0.999), which saturates raw cosines and makes
+  the loss vacuous; the residuals carry the actual slot differentiation.
+  Enabled in `train_slot3_xcrop.sh` (first xcrop run without it confirmed the
+  trivial solution: consistency loss 0.94 -> 0.0003 by step 6k via collapse).
+
+**Layer-restricted slot competition** — `student.slot_start_layer`
+- Blocks before `slot_start_layer` use standard register rows (keeping
+  `patch_cls_attn_type`); blocks from it onward use slot competition. Attention
+  extraction (viz/MBO/diagnostics) uses the per-layer convention automatically.
+  `train_slot4_late.sh` starts the competition at layer 6 (of 12).
+
+**Symmetric register orthogonalization** — `student.register_orthogonalize`
+- After every block, the R register tokens are re-projected per image with
+  regularized Löwdin symmetric orthogonalization
+  `Y = (XX^T + alpha I)^{-1/2} X`, where
+  `alpha = register_orth_eps * mean(diag(XX^T))` (default eps 1e-6). Without
+  the ridge this is the closest row-orthonormal matrix to the originals; the
+  ridge trades exact orthogonality for continuity near rank deficiency. The
+  Gram eigendecomposition runs in float64, and a custom Fréchet derivative
+  differentiates the complete regularized map without unstable eigenvector-gap
+  terms, including when Gram eigenvalues repeat.
+  `register_orth_preserve_norm` (default true) rescales each
+  register back to its pre-projection norm so only directions are constrained.
+  Directly prevents the register collapse onto a shared direction observed in
+  slot2/slot3. Enable with `student.register_orthogonalize=true` for SSL or
+  `model.register_orthogonalize=true` for the classification trainer.
+
+**Disable patch-to-patch attention** — `patch_to_patch_attention=false`
+- Requires slot attention from layer 0. CLS queries still attend to every key;
+  patch queries attend only to CLS/register keys; register queries attend only
+  to CLS/patch keys (set `register_attn_exclude_cls=false` for the CLS edge).
+- The implementation decomposes the graph into small SDPA calls instead of
+  applying a dense mask, so it never computes or stores `P x P` patch scores.
+  Patch rows use one normalized softmax over the combined CLS/register key set;
+  CLS is not added as an unconditional residual. The skinny `P x (1+R)` branch
+  explicitly selects PyTorch's fused memory-efficient CUDA SDPA backend, which
+  benchmarks faster than FlashAttention and custom Triton kernels for this shape.
+
+**Learnable register-budget gate** — `student.register_budget_gate`
+- Per-head, per-layer multiplier on the separate register budget:
+  `out = out_nonreg + g * out_reg`, `g` init 1 (exactly ungated at init), no
+  weight decay. Gate values appear in wandb under `register_gate/*` (per layer
+  mean/min/max over heads), logged by the register diagnostics from the EMA
+  teacher. Enabled in `train_slot5_gate.sh`.
+
+**Register diagnostics** — `dinov3/eval/register_tokens/diagnostics.py`
+- `register_diagnostics.*` config (default every 500 steps, 32 fixed images, a
+  few seconds per run, EMA-teacher backbone). wandb scalars under
+  `register_diag/*`:
+  * slot usage: `slot_share_max/min`, `slot_usage_entropy` (1 = balanced),
+    `active_slots`, `patch_assign_entropy` (competition softness),
+    `slot_spatial_entropy`;
+  * register features: `reg_norm_mean`, `reg_pairwise_cos` (redundancy),
+    `reg_resid_pairwise_cos` / `reg_resid_norm_frac` (same on mean-subtracted
+    residuals — raw cosine saturates once registers share a direction);
+  * patch-token outliers (the original register motivation):
+    `patch_norm_outlier_frac[_3x]`, `patch_norm_max/p99_over_median`,
+    `register_norm_over_patch_median`, `cls_norm_over_patch_median`;
+  * cross-crop agreement on two fixed views: `xcrop_matched_cos`
+    (Hungarian-matched register cosine), `xcrop_identity_match_frac`, plus
+    `xcrop_resid_*` variants on mean-subtracted residuals.
+
+**Model wiring** — `dinov3/models/vision_transformer.py`, `dinov3/models/__init__.py`
+- `register_attn_type` (`standard`|`slot`), `slot_mode`,
+  `register_attn_exclude_cls`, `patch_cls_attn_type`, `slot_start_layer`,
+  `register_budget_gate`, and `register_init` flow from config.
+- `register_init="gaussian"` mirrors `masked_ocl`: shared `[1, 1, D]`
+  mean/log-std parameters initialized with Xavier uniform, with independent
+  standard-normal noise sampled per image and register.
+- `DinoVisionTransformer.get_register_attention_maps(...)` returns either
+  head-averaged `[B, R, H, W]` masks or per-head `[B, heads, R, H, W]` masks.
+  `get_register_patch_attention(x, layer)` remains as the register→patch wrapper.
+
+**Config** — `dinov3/configs/ssl_default_config.yaml`
+- `student.register_attn_type`, `student.slot_mode`,
+  `student.register_attn_exclude_cls`, `student.patch_cls_attn_type`,
+  `student.register_init`
+- `train.wandb.*`, `schedule.*` (step-based), `register_viz.*`, `mbo.*`
+
+**Step-based scheduling** — `dinov3/train/step_schedule.py`
+- `schedule.enabled` maps `total_steps / warmup_steps /
+  freeze_last_layer_steps / teacher_temp_warmup_steps` onto the epoch machinery
+  (by setting `OFFICIAL_EPOCH_LENGTH = 1`). Eval/ckpt/viz/MBO periods are already
+  in steps.
+
+**Training loop** — `dinov3/train/train.py`
+- W&B init + per-step scalar logging.
+- Periodic register-attention viz + COCO MBO (`RegisterEvaluator`), run on a
+  plain eval backbone kept in sync with the EMA teacher.
+
+**Host-memory hygiene (small-RAM hosts)** — `dinov3/utils/memory.py`,
+`dinov3/train/train.py`, `dinov3/data/augmentations.py`, `dinov3/train/ssl_meta_arch.py`
+- `train.normalize_on_gpu`: dataloader workers ship uint8 crops; scaling and
+  mean/std normalization run on the GPU in the compute dtype
+  (`SSLMetaArch._maybe_gpu_normalize`). Cuts shared-memory and pinned-host
+  batch traffic ~4x and saves worker CPU.
+- The periodic GC and post-eval cleanup also flush the CUDA pinned-host cache
+  (`release_memory(empty_pinned_cache=True)`): the caching host allocator never
+  returns blocks to the OS by itself, so its fragmentation-driven growth
+  otherwise looks like a slow host-RAM leak.
+- Eval dataloaders use `pin_memory=False`; the training log line reports the
+  pinned-cache size (`pinned: ...`).
+
+**Dataset** — `dinov3/data/datasets/imagenet_packed.py` (+ loader registration)
+- `ImageNetPacked`: mmap blob + index, random access for the SSL sampler.
+
+**Register-token eval package** — `dinov3/eval/register_tokens/`
+- `backbone.py` (plain eval backbone + EMA sync), `attention_viz.py`
+  (per-register heatmaps + argmax object-centric segmentation),
+  `mbo.py` (COCO instance/semantic MBO), `evaluator.py` (scheduling/orchestration).
+
+**Tools** — `register_project/tools/` (parquet repack, COCO download).
+
+---
+
+## Notes & defaults
+
+- **Registers attend to cls + patches only**, never to any register (incl. self).
+- **Viz/MBO masks** include register→patch and patch→register views. COCO
+  validation also reports last block, penultimate block, all-layer averaged,
+  second-half-layer averaged, and last-block per-head masks. The legacy
+  `mbo_instance` / `mbo_semantic` keys remain aliases for last-block
+  register→patch.
+- **MBO** turns register attention into segments via per-pixel argmax over
+  registers, then reports mean-best-IoU vs COCO GT (instance = per-object,
+  semantic = per-category). GT from `instances_val2017.json` (things classes).
+- **LR**: `optim.scaling_rule: sqrt_wrt_1024` scales the base LR by batch size
+  automatically (≈2.8e-3 at batch 512). Tune in the YAML if unstable.
+- Single-GPU training uses FSDP (`SHARD_GRAD_OP`) + `torch.compile`. Set
+  `train.compile: false` for faster startup while iterating.
+- **Effective batch 512** is reached via **gradient accumulation**
+  (`train.batch_size_per_gpu: 128` × `train.grad_accum_steps: 4`). This box has a
+  95 GB GPU but only **31 GB host RAM**, so: a full 512 micro-batch OOMs the GPU,
+  and 10 dataloader workers at large batch OOM the host. The 128×4 setup peaks at
+  ~38 GB GPU / ~16 GB RAM with `num_workers: 8`. To change the effective batch,
+  adjust either factor (e.g. `batch_size_per_gpu=256 grad_accum_steps=2` for fewer,
+  larger steps if you have GPU headroom). LR scaling uses the *effective* batch.
+- Dataset roots in configs may use `~` (expanded automatically).
+- **`train.compile` and host RAM**: `torch.compile=true` grows host RAM (~0.3 GB/min
+  via Inductor) and OOMs a 31 GB box in ~50 min (the OOM killer sends SIGTERM →
+  `torchrun` reports `Process ... got signal: 15`). The configs ship `compile:
+  false`, which is stable (~16 GB flat). Re-enable compile only on a high-RAM
+  machine. To diagnose an OOM kill: `journalctl -k --since "10 min ago" | grep -i oom`.

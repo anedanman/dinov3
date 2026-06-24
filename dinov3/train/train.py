@@ -6,10 +6,12 @@
 import argparse
 import copy
 import gc
+from datetime import timedelta
 import logging
 import math
 import os
 import sys
+import time
 from functools import partial
 from pathlib import Path
 
@@ -36,15 +38,68 @@ from dinov3.data import (
     CombinedDataLoader,
 )
 from dinov3.logging import MetricLogger, setup_logging
+from dinov3.logging import wandb_logger
 from dinov3.train.cosine_lr_scheduler import CosineScheduler, linear_warmup_cosine_decay
 from dinov3.train.multidist_meta_arch import MultiDistillationMetaArch
 from dinov3.train.ssl_meta_arch import SSLMetaArch
+from dinov3.train.step_schedule import normalize_step_schedule
+from dinov3.utils.memory import release_memory
+from dinov3.eval.register_tokens.evaluator import RegisterEvaluator
+from dinov3.eval.simple_periodic import SimplePeriodicEvaluator
 
 assert torch.__version__ >= (2, 1)
 torch.backends.cuda.matmul.allow_tf32 = True  # pytorch 1.12 sets this to false by default
 torch.backends.cudnn.benchmark = False  # True
 
 logger = logging.getLogger("dinov3")
+
+
+def _empty_target_transform(_):
+    return ()
+
+
+def _format_mbo_metrics_for_wandb(metrics: dict) -> dict:
+    """Group MBO metrics in W&B by attention direction and GT target type."""
+    formatted = {}
+    aliases = {}
+    for key, value in metrics.items():
+        if key == "mbo_n_images":
+            formatted["mbo_metadata/n_images"] = value
+            continue
+        if key == "mbo_instance":
+            aliases["mbo_register2patches_instance/last"] = value
+            continue
+        if key == "mbo_semantic":
+            aliases["mbo_register2patches_semantic/last"] = value
+            continue
+
+        direction = None
+        rest = None
+        if key.startswith("mbo_register2patch_"):
+            direction = "register2patches"
+            rest = key[len("mbo_register2patch_") :]
+        elif key.startswith("mbo_patch2register_"):
+            direction = "patches2registers"
+            rest = key[len("mbo_patch2register_") :]
+
+        if direction is None:
+            formatted[f"mbo_metadata/{key.removeprefix('mbo_')}"] = value
+            continue
+
+        if rest.endswith("_instance"):
+            target = "instance"
+            variant = rest[: -len("_instance")]
+        elif rest.endswith("_semantic"):
+            target = "semantic"
+            variant = rest[: -len("_semantic")]
+        else:
+            formatted[f"mbo_metadata/{key.removeprefix('mbo_')}"] = value
+            continue
+        formatted[f"mbo_{direction}_{target}/{variant}"] = value
+
+    for key, value in aliases.items():
+        formatted.setdefault(key, value)
+    return formatted
 
 
 def get_args_parser(add_help: bool = True):
@@ -157,18 +212,20 @@ def build_schedulers_v2(cfg):
     total_iterations = cfg.train.OFFICIAL_EPOCH_LENGTH * cfg.optim.epochs
     logger.info(f"Total training iterations {total_iterations}")
 
-    # LR scaling rules
+    # LR scaling rules (use the EFFECTIVE batch size, including gradient accumulation)
+    grad_accum = max(1, int(cfg.train.get("grad_accum_steps", 1)))
+    effective_batch = cfg.train.batch_size_per_gpu * distributed.get_world_size() * grad_accum
     lr_peak = cfg.schedules.lr.peak
     lr_end = cfg.schedules.lr.end
     if cfg.optim.scaling_rule == "linear_wrt_256":
-        lr_peak *= cfg.train.batch_size_per_gpu * distributed.get_world_size() / 256.0
-        lr_end *= cfg.train.batch_size_per_gpu * distributed.get_world_size() / 256.0
+        lr_peak *= effective_batch / 256.0
+        lr_end *= effective_batch / 256.0
         logger.info(
             f"Scaling rule {cfg.optim.scaling_rule}, LR peak {cfg.schedules.lr.peak} -> {lr_peak}, LR end {cfg.schedules.lr.end} -> {lr_end}"
         )
     elif cfg.optim.scaling_rule == "sqrt_wrt_1024":
-        lr_peak *= 4 * math.sqrt(cfg.train.batch_size_per_gpu * distributed.get_world_size() / 1024.0)
-        lr_end *= 4 * math.sqrt(cfg.train.batch_size_per_gpu * distributed.get_world_size() / 1024.0)
+        lr_peak *= 4 * math.sqrt(effective_batch / 1024.0)
+        lr_end *= 4 * math.sqrt(effective_batch / 1024.0)
         logger.info(
             f"Scaling rule {cfg.optim.scaling_rule}, LR peak {cfg.schedules.lr.peak} -> {lr_peak}, LR end {cfg.schedules.lr.end} -> {lr_end}"
         )
@@ -289,15 +346,21 @@ def build_data_loader_from_cfg(
         local_batch_size = None  # will default to the standard local batch size matching the data batch size
         dataloader_batch_size_per_gpu = cfg.train.batch_size_per_gpu
 
+    if cfg.train.get("normalize_on_gpu", False):
+        # Crops travel as uint8 and are scaled/normalized on the GPU
+        # (SSLMetaArch._maybe_gpu_normalize): 4x less shm/pinned-host traffic.
+        collate_dtype = torch.uint8
+    else:
+        collate_dtype = {
+            "fp32": torch.float32,
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+        }[cfg.compute_precision.param_dtype]
     collate_fn = partial(
         collate_data_and_cast,
         mask_ratio_tuple=cfg.ibot.mask_ratio_min_max,
         mask_probability=cfg.ibot.mask_sample_probability,
-        dtype={
-            "fp32": torch.float32,
-            "fp16": torch.float16,
-            "bf16": torch.bfloat16,
-        }[cfg.compute_precision.param_dtype],
+        dtype=collate_dtype,
         n_tokens=n_tokens,
         mask_generator=mask_generator,
         random_circular_shift=cfg.ibot.mask_random_circular_shift,
@@ -309,7 +372,7 @@ def build_data_loader_from_cfg(
     dataset = make_dataset(
         dataset_str=dataset_path,
         transform=model.build_data_augmentation_dino(cfg),
-        target_transform=lambda _: (),
+        target_transform=_empty_target_transform,
     )
 
     if isinstance(dataset, torch.utils.data.IterableDataset):
@@ -317,6 +380,7 @@ def build_data_loader_from_cfg(
     else:
         sampler_type = SamplerType.SHARDED_INFINITE if cfg.train.cache_dataset else SamplerType.INFINITE
 
+    grad_accum = max(1, int(cfg.train.get("grad_accum_steps", 1)))
     data_loader = make_data_loader(
         dataset=dataset,
         batch_size=batch_size,
@@ -324,9 +388,14 @@ def build_data_loader_from_cfg(
         shuffle=True,
         seed=cfg.train.seed + start_iter + 1,
         sampler_type=sampler_type,
-        sampler_advance=start_iter * dataloader_batch_size_per_gpu,
+        # Each optimizer step consumes `grad_accum` micro-batches.
+        sampler_advance=start_iter * dataloader_batch_size_per_gpu * grad_accum,
         drop_last=True,
         collate_fn=collate_fn,
+        persistent_workers=cfg.train.get("persistent_workers", False),
+        pin_memory=cfg.train.get("pin_memory", True),
+        prefetch_factor=cfg.train.get("prefetch_factor", None),
+        multiprocessing_context=cfg.train.get("dataloader_multiprocessing_context", None),
     )
     return data_loader
 
@@ -401,6 +470,7 @@ def do_train(cfg, model, resume=False):
         )
     model.init_weights()
     start_iter = 0
+    resumed_from_checkpoint = False
     if resume and (last_checkpoint_dir := find_latest_checkpoint(ckpt_dir)):
         logger.info(f"Checkpoint found {last_checkpoint_dir}")
         start_iter = (
@@ -413,12 +483,164 @@ def do_train(cfg, model, resume=False):
             )
             + 1
         )
+        resumed_from_checkpoint = True
     OFFICIAL_EPOCH_LENGTH = cfg.train.OFFICIAL_EPOCH_LENGTH
     max_iter = cfg.optim.epochs * OFFICIAL_EPOCH_LENGTH
+    grad_accum = max(1, int(cfg.train.get("grad_accum_steps", 1)))
     if cfg.multidistillation.enabled:
         global_batch_size = cfg.multidistillation.global_batch_size
     else:
-        global_batch_size = cfg.train.batch_size_per_gpu * distributed.get_world_size()
+        global_batch_size = cfg.train.batch_size_per_gpu * distributed.get_world_size() * grad_accum
+    if grad_accum > 1:
+        logger.info(
+            f"Gradient accumulation: {grad_accum} micro-batches/step "
+            f"-> effective batch {global_batch_size} (micro {cfg.train.batch_size_per_gpu} x world "
+            f"{distributed.get_world_size()} x accum {grad_accum})"
+        )
+
+    # Weights & Biases + register-token evaluator (viz + COCO MBO)
+    wandb_run = wandb_logger.init_wandb(cfg)
+    wandb_log_freq = cfg.train.get("wandb", {}).get("log_freq", 10) if cfg.train.get("wandb", None) else 10
+    register_evaluator = RegisterEvaluator(cfg)
+    simple_evaluator = SimplePeriodicEvaluator(cfg)
+
+    def _synchronize_cuda():
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    def _release_eval_memory(reason: str):
+        release_memory(
+            empty_cuda_cache=bool(cfg.train.get("empty_cuda_cache_after_eval", False)),
+            empty_pinned_cache=True,
+        )
+        logger.info("Released temporary memory after %s", reason)
+
+    def _run_register_validation(step: int, run_viz: bool, run_mbo: bool, reason: str, run_diffcut: bool = False):
+        if not (run_viz or run_mbo or run_diffcut):
+            return
+        logger.info(
+            "Running register validation at step %d (%s): viz=%s mbo=%s diffcut=%s",
+            step,
+            reason,
+            run_viz,
+            run_mbo,
+            run_diffcut,
+        )
+        _synchronize_cuda()
+        try:
+            register_evaluator.sync(model)  # collective (full_tensor); all ranks must call
+            if run_viz and distributed.is_main_process():
+                viz_outputs = None
+                try:
+                    viz_outputs = register_evaluator.run_viz()
+                    if isinstance(viz_outputs, dict):
+                        for key, panels in viz_outputs.items():
+                            wandb_logger.log_images(wandb_run, panels, step=step, key=key)
+                    else:
+                        wandb_logger.log_images(wandb_run, viz_outputs, step=step, key="register_attention")
+                except Exception as e:
+                    logger.warning(f"register viz failed: {e}")
+                finally:
+                    if isinstance(viz_outputs, dict):
+                        viz_outputs.clear()
+                    del viz_outputs
+            if run_mbo:
+                mbo_metrics = None
+                try:
+                    mbo_metrics = register_evaluator.run_mbo()  # collective: images sharded across ranks
+                    if distributed.is_main_process():
+                        wandb_logger.log_scalars(wandb_run, _format_mbo_metrics_for_wandb(mbo_metrics), step=step)
+                except Exception as e:
+                    logger.warning(f"MBO eval failed: {e}")
+                finally:
+                    del mbo_metrics
+            if run_diffcut:
+                try:
+                    diffcut_metrics = register_evaluator.run_diffcut()  # collective: images sharded across ranks
+                    if distributed.is_main_process():
+                        wandb_logger.log_scalars(
+                            wandb_run, {f"diffcut/{k}": v for k, v in diffcut_metrics.items()}, step=step
+                        )
+                        diffcut_panels = register_evaluator.run_diffcut_viz()
+                        if diffcut_panels:
+                            wandb_logger.log_images(wandb_run, diffcut_panels, step=step, key="diffcut_seg")
+                except Exception as e:
+                    logger.warning(f"DiffCut eval failed: {e}")
+        finally:
+            model.train()
+            _synchronize_cuda()
+            _release_eval_memory("register validation")
+
+    def _run_register_diagnostics(step: int, reason: str):
+        if not register_evaluator.should_run_diagnostics(step):
+            return
+        _synchronize_cuda()
+        try:
+            register_evaluator.sync(model)  # collective (full_tensor); all ranks must call
+            if distributed.is_main_process():
+                try:
+                    diag_metrics = register_evaluator.run_diagnostics()
+                    wandb_logger.log_scalars(wandb_run, diag_metrics, step=step)
+                    logger.info(
+                        "Register diagnostics at step %d (%s): "
+                        "slot_usage_entropy=%.3f active_slots=%.2f xcrop_cos=%.3f xcrop_resid_cos=%.3f outlier_frac=%.4f",
+                        step,
+                        reason,
+                        diag_metrics.get("register_diag/slot_usage_entropy", float("nan")),
+                        diag_metrics.get("register_diag/active_slots", float("nan")),
+                        diag_metrics.get("register_diag/xcrop_matched_cos", float("nan")),
+                        diag_metrics.get("register_diag/xcrop_resid_matched_cos", float("nan")),
+                        diag_metrics.get("register_diag/patch_norm_outlier_frac", float("nan")),
+                    )
+                except Exception as e:
+                    logger.warning(f"register diagnostics failed: {e}")
+        finally:
+            model.train()
+            _synchronize_cuda()
+
+    def _run_simple_validation(step: int, reason: str):
+        simple_due = simple_evaluator.due(step, final_step=max_iter - 1)
+        if not simple_due.any:
+            return
+        logger.info(
+            "Running simple periodic eval at step %d (%s): knn=%s knn_full=%s linear=%s coco_linear_seg=%s",
+            step,
+            reason,
+            simple_due.knn,
+            simple_due.knn_full,
+            simple_due.linear,
+            simple_due.coco_seg,
+        )
+        _synchronize_cuda()
+        simple_metrics = None
+        try:
+            simple_evaluator.sync(model)  # collective (full_tensor); all ranks must call
+            simple_metrics = simple_evaluator.run(step, simple_due)
+            if distributed.is_main_process() and simple_metrics:
+                wandb_logger.log_scalars(wandb_run, simple_metrics, step=step)
+                metric_logger.update(**{k.replace("/", "_"): v for k, v in simple_metrics.items()})
+        finally:
+            del simple_metrics
+            model.train()
+            _synchronize_cuda()
+            _release_eval_memory("simple periodic eval")
+
+    # Metric logging
+    logger.info("Starting training from iteration %d", start_iter)
+    metrics_file = os.path.join(cfg.train.output_dir, "training_metrics.json")
+    metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file)
+
+    if resumed_from_checkpoint:
+        # The checkpoint stores the state after iteration start_iter - 1.
+        resume_step = max(start_iter - 1, 0)
+        _run_register_validation(
+            step=resume_step,
+            run_viz=register_evaluator.viz_enabled,
+            run_mbo=register_evaluator.mbo_enabled,
+            run_diffcut=register_evaluator.diffcut_enabled,
+            reason="checkpoint resume",
+        )
+        _run_simple_validation(step=resume_step, reason="checkpoint resume")
 
     # Build data loader
     data_loader = build_multi_resolution_data_loader_from_cfg(
@@ -427,13 +649,9 @@ def do_train(cfg, model, resume=False):
         start_iter=start_iter,
     )
 
-    # Metric logging
-    logger.info("Starting training from iteration %d", start_iter)
-    metrics_file = os.path.join(cfg.train.output_dir, "training_metrics.json")
-    metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file)
     # Manual garbage collection
     gc.disable()
-    gc.collect()
+    release_memory()
 
     # Training loop
     student = model.student
@@ -451,22 +669,25 @@ def do_train(cfg, model, resume=False):
         num_gram_updates = math.ceil((start_iter + 1 - cfg.gram.it_first_update) / cfg.gram.update_frequency)
         logger.info(f"Gram was updated {num_gram_updates} times before iteration {start_iter}")
     consecutive_nan_count = 0
-    for data in metric_logger.log_every(
-        data_loader,
+    data_iter = iter(data_loader)
+    for _ in metric_logger.log_every(
+        range(start_iter, max_iter),
         print_freq=10,
         header="Training",
         n_iterations=max_iter,
         start_iteration=start_iter,
     ):
         it = iteration
-        data["global_batch_size"] = global_batch_size
         if iteration > max_iter:
             return
 
-        # Garbage collection (trigger manually so it happens on all ranks at the same time)
+        # Garbage collection (trigger manually so it happens on all ranks at the same time).
+        # Also flush unused pinned-host blocks: the caching host allocator never
+        # returns them to the OS on its own, so on small-RAM hosts its slow
+        # fragmentation-driven growth behaves like a leak.
         if (iteration + 1) % 150 == 0:
             logger.info("Garbage collection")
-            gc.collect()
+            release_memory(empty_pinned_cache=True)
 
         if cfg.gram.use_loss and model.gram_it_load_ema_teacher == it:
             logger.info(f"Loading EMA teacher into Gram teacher before iteration {it}")
@@ -480,9 +701,37 @@ def do_train(cfg, model, resume=False):
         last_layer_lr = last_layer_lr_schedule[it]
         apply_optim_scheduler(optimizer, lr, wd, last_layer_lr)
 
-        # Forward backward
+        # Forward backward over `grad_accum` micro-batches, accumulating gradients.
         optimizer.zero_grad(set_to_none=True)
-        total_loss, metrics_dict = model.forward_backward(data, teacher_temp=teacher_temp, iteration=it)
+        total_loss = None
+        accum_metrics = {}
+        loss_scale = 1.0 / grad_accum
+        num_micro_batches = 0
+        data_fetch_time = 0.0
+        for _ in range(grad_accum):
+            fetch_start = time.time()
+            try:
+                micro = next(data_iter)
+            except StopIteration:
+                data_iter = iter(data_loader)
+                micro = next(data_iter)
+            data_fetch_time += time.time() - fetch_start
+            num_micro_batches += 1
+
+            micro["global_batch_size"] = global_batch_size
+            micro_loss, micro_metrics = model.forward_backward(
+                micro, teacher_temp=teacher_temp, iteration=it, loss_scale=loss_scale
+            )
+            micro_loss = micro_loss.detach()
+            total_loss = micro_loss if total_loss is None else total_loss + micro_loss
+            for k, v in micro_metrics.items():
+                vt = v.detach() if torch.is_tensor(v) else torch.as_tensor(
+                    v, dtype=torch.float32, device=micro_loss.device
+                )
+                accum_metrics[k] = vt if k not in accum_metrics else accum_metrics[k] + vt
+        # Average reported loss / metrics over the accumulated micro-batches.
+        total_loss = total_loss / num_micro_batches
+        metrics_dict = {k: v / num_micro_batches for k, v in accum_metrics.items()}
 
         # Gradient clipping
         if cfg.optim.clip_grad:
@@ -548,7 +797,29 @@ def do_train(cfg, model, resume=False):
         metric_logger.update(wd=wd)
         metric_logger.update(mom=mom)
         metric_logger.update(last_layer_lr=last_layer_lr)
+        metric_logger.update(data_fetch_time=data_fetch_time)
         metric_logger.update(total_loss=total_loss, **metrics_dict)
+
+        # Weights & Biases scalar logging
+        if wandb_run is not None and iteration % wandb_log_freq == 0:
+            scalars = {"train/lr": lr, "train/wd": wd, "train/mom": mom, "train/last_layer_lr": last_layer_lr}
+            scalars["train/total_loss"] = total_loss.item() if torch.is_tensor(total_loss) else total_loss
+            for k, v in metrics_dict.items():
+                scalars[f"train/{k}"] = v.item() if torch.is_tensor(v) else v
+            wandb_logger.log_scalars(wandb_run, scalars, step=iteration)
+
+        # Cheap quantitative register diagnostics (fixed batch, scalar metrics)
+        _run_register_diagnostics(iteration, reason="scheduled")
+
+        # Register-token evaluation: attention visualization + COCO MBO
+        run_viz = register_evaluator.should_run_viz(iteration)
+        run_mbo = register_evaluator.should_run_mbo(iteration)
+        run_diffcut = register_evaluator.should_run_diffcut(iteration)
+        if run_viz or run_mbo or run_diffcut:
+            _run_register_validation(iteration, run_viz, run_mbo, reason="scheduled", run_diffcut=run_diffcut)
+
+        # Lightweight periodic KNN / linear / COCO linear segmentation probes.
+        _run_simple_validation(iteration, reason="scheduled")
 
         # Submit evaluation jobs
         if (
@@ -573,10 +844,15 @@ def do_train(cfg, model, resume=False):
                 keep_last_n_checkpoints(ckpt_dir, cfg.checkpointing.max_to_keep)
                 if "keep_every" in cfg.checkpointing and (iteration + 1) % cfg.checkpointing.keep_every == 0:
                     keep_checkpoint_copy(ckpt_dir / str(iteration))
+                    if wandb_run is not None and cfg.checkpointing.get("wandb_upload", False):
+                        wandb_logger.log_checkpoint_artifact(
+                            wandb_run, ckpt_dir / f"{iteration}_keep", step=iteration
+                        )
 
         iteration = iteration + 1
     metric_logger.synchronize_between_processes()
 
+    wandb_logger.finish(wandb_run)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
@@ -593,8 +869,15 @@ def main(argv=None):
         logger.info("setup_multidistillation done")
         assert cfg.MODEL.META_ARCHITECTURE == "MultiDistillationMetaArch"
     else:
-        setup_job(output_dir=args.output_dir, seed=args.seed)
+        # Rank-0-only evals (simple/viz/mbo/diffcut) keep the other ranks waiting in a
+        # pending collective; the NCCL default 10-min timeout SIGABRTs the job mid-eval.
+        setup_job(
+            output_dir=args.output_dir,
+            seed=args.seed,
+            distributed_timeout=timedelta(minutes=int(os.environ.get("DINOV3_NCCL_TIMEOUT_MIN", "240"))),
+        )
         cfg = setup_config(args, strict_cfg=False)
+        cfg = normalize_step_schedule(cfg)
         logger.info(cfg)
         setup_logging(
             output=os.path.join(os.path.abspath(args.output_dir), "nan_logs"),

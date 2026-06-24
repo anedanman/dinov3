@@ -7,7 +7,21 @@ from typing import Any, Tuple
 
 from torchvision.datasets import VisionDataset
 
+from dinov3.utils.memory import PeriodicMemoryTrimmer
+
 from .decoders import Decoder, ImageDataDecoder, TargetDecoder
+
+
+# Explicit per-item malloc_trim(0) is an expensive heap walk in the dataloader
+# hot path. Default off (0) for throughput; glibc still returns freed memory
+# lazily via MALLOC_TRIM_THRESHOLD_. Set DINOV3_DATASET_MALLOC_TRIM_EVERY>0 to
+# re-enable periodic trimming on RAM-constrained machines.
+_SAMPLE_TRIMMER = PeriodicMemoryTrimmer("DINOV3_DATASET_MALLOC_TRIM_EVERY", 0)
+
+
+def _maybe_trim_worker_heap() -> None:
+    """Periodically return freed decoder/augmentation arenas from workers to the OS."""
+    _SAMPLE_TRIMMER.maybe_trim()
 
 
 class ExtendedVisionDataset(VisionDataset):
@@ -40,6 +54,8 @@ class ExtendedVisionDataset(VisionDataset):
         if self.transforms is not None:
             image, target = self.transforms(image, target)
 
+        del image_data
+        _maybe_trim_worker_heap()
         return image, target
 
     def __len__(self) -> int:

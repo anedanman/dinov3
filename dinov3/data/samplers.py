@@ -94,12 +94,19 @@ class InfiniteSampler(Sampler):
         self._advance = advance
 
     def __iter__(self):
+        advance = self._advance
+        cycle_sample_count = (self._sample_count - self._start + self._step - 1) // self._step
+        if cycle_sample_count > 0:
+            # Resume can request many full dataset cycles worth of skipped samples.
+            # Dropping those cycles avoids an O(start_iter * batch_size) warm-up.
+            advance = advance % cycle_sample_count
+
         if self._shuffle:
             iterator = self._shuffled_iterator()
         else:
             iterator = self._iterator()
 
-        yield from itertools.islice(iterator, self._advance, None)
+        yield from itertools.islice(iterator, advance, None)
 
     def _iterator(self):
         assert not self._shuffle

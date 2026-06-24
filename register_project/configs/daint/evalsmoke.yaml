@@ -1,0 +1,125 @@
+# ===========================================================================
+# Smoke test for rank-parallel in-training evals on one Daint node (4x GH200).
+# Tiny eval sizes, every eval due at step 99; compile off so the whole run
+# (startup + ~150 steps + all eval paths) fits a 30-min debug job.
+#   sbatch -p debug ... sbatch_train.sh evalsmoke evalsmoke
+# ===========================================================================
+MODEL:
+  META_ARCHITECTURE: SSLMetaArch
+
+train:
+  batch_size_per_gpu: 128
+  grad_accum_steps: 1
+  dataset_path: ImageNetPacked:split=TRAIN:root=/capstor/scratch/cscs/fbombass/datasets/imagenet1k_packed
+  num_workers: 8
+  pin_memory: true
+  prefetch_factor: 4
+  persistent_workers: true
+  dataloader_multiprocessing_context: forkserver
+  normalize_on_gpu: true
+  compile: false
+  OFFICIAL_EPOCH_LENGTH: 1
+  wandb:
+    enabled: false
+
+student:
+  arch: vit_small
+  patch_size: 16
+  drop_path_rate: 0.1
+  layerscale: 1.0e-05
+  n_storage_tokens: 4
+  register_attn_type: standard
+
+crops:
+  global_crops_size: 256
+  local_crops_size: 112
+
+schedule:
+  enabled: true
+  total_steps: 200000
+  warmup_steps: 10000
+  freeze_last_layer_steps: 1000
+  teacher_temp_warmup_steps: 30000
+
+optim:
+  scaling_rule: sqrt_wrt_1024
+
+evaluation:
+  eval_period_iterations: 0
+  simple:
+    enabled: true
+    knn:
+      enabled: true
+      period_steps: 100
+      train_dataset: ImageNetPacked:split=TRAIN:root=/capstor/scratch/cscs/fbombass/datasets/imagenet1k_packed
+      val_dataset: ImageNetPacked:split=VAL:root=/capstor/scratch/cscs/fbombass/datasets/imagenet1k_packed
+      image_size: 256
+      max_train_images: 2000
+      max_val_images: 500
+      full_at_end: false
+    linear:
+      enabled: true
+      period_steps: 100
+      train_dataset: ImageNetPacked:split=TRAIN:root=/capstor/scratch/cscs/fbombass/datasets/imagenet1k_packed
+      val_dataset: ImageNetPacked:split=VAL:root=/capstor/scratch/cscs/fbombass/datasets/imagenet1k_packed
+      image_size: 256
+      max_train_images: 3000
+      max_val_images: 500
+      batch_size: 256
+      probe_batch_size: 8192
+      epochs: 2
+    coco_linear_segmentation:
+      enabled: true
+      period_steps: 100
+      coco_root: /capstor/scratch/cscs/fbombass/datasets/coco
+      train_split: train2017
+      val_split: val2017
+      image_size: 256
+      max_train_images: 400
+      max_val_images: 100
+      batch_size: 64
+      epochs: 2
+
+checkpointing:
+  period: 1000000
+  max_to_keep: 1
+  keep_every: 1000000
+  wandb_upload: false
+
+register_diagnostics:
+  enabled: true
+  every_n_steps: 100
+  num_images: 16
+  image_size: 256
+  outlier_ratio: 2.0
+  crop_pairs: true
+
+register_viz:
+  enabled: true
+  every_n_steps: 100
+  num_images: 4
+  coco_num_images: 4
+  layer: -1
+  dataset: ImageNetPacked:split=VAL:root=/capstor/scratch/cscs/fbombass/datasets/imagenet1k_packed
+  image_size: 256
+
+diffcut:
+  enabled: true
+  every_n_steps: 100
+  coco_root: /capstor/scratch/cscs/fbombass/datasets/coco
+  split: val2017
+  max_images: 40
+  resolutions: [256, 1024]
+  tau: 0.5
+  alpha: 10
+
+mbo:
+  enabled: true
+  every_n_steps: 100
+  coco_root: /capstor/scratch/cscs/fbombass/datasets/coco
+  split: val2017
+  max_images: 80
+  layer: -1
+  image_size: 256
+  instance: true
+  semantic: true

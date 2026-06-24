@@ -1,0 +1,101 @@
+seed: 0
+
+model:
+  arch: vit_small
+  image_size: 224
+  patch_size: 16
+  num_classes: 1000
+  pooling: global_avg_all
+  qkv_bias: true
+  drop_path_rate: 0.1
+  layerscale: 1.0e-5
+  n_storage_tokens: 4
+  register_attn_type: standard
+  slot_mode: slot
+  register_attn_exclude_cls: true
+  patch_cls_attn_type: standard
+  register_init: learned
+
+train:
+  dataset: ImageNetPacked:split=TRAIN:root=~/datasets/imagenet1k_packed
+  output_dir: ~/dinov3-runs/vits-im1k-reg4-baseline-avgpool-ra-mixup-100ep
+  epochs: 100
+  total_steps: 125100
+  batch_size: 1024
+  auto_microbatch: true
+  min_microbatch: 64
+  precision: bf16
+  compile: true
+  gpu_decode: true        # decode + augment on GPU (workers only read raw JPEG bytes)
+  num_workers: 8
+  pin_memory: true
+  prefetch_factor: 4
+  persistent_workers: true
+  multiprocessing_context: forkserver
+  log_every_steps: 20
+  augmentations:
+    hflip_prob: 0.5
+    randaugment:
+      enabled: true
+      num_ops: 2
+      magnitude: 10
+  mixup:
+    enabled: true
+    prob: 1.0
+    alpha: 0.2
+
+optim:
+  lr: 0.001
+  min_lr: 1.0e-6
+  scheduler: cosine
+  warmup_steps: 10000
+  weight_decay: 0.0001
+  label_smoothing: 0.0
+  clip_grad_norm: 1.0
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+validation:
+  dataset: ImageNetPacked:split=VAL:root=~/datasets/imagenet1k_packed
+  resize_size: 256
+  batch_size: 512
+  num_workers: 2
+  every_n_steps: 12510   # every 10 epochs
+
+extra_validation:
+  imagenet_real:
+    enabled: true
+    labels_path: ~/datasets/imagenet_real/real.json
+  imagenet_v2:
+    enabled: true
+    root: ~/datasets/imagenetv2
+    batch_size: 512
+    num_workers: 2
+
+checkpointing:
+  keep_every_steps: 31275   # every 25 epochs
+
+register_diagnostics:
+  enabled: true
+  every_n_steps: 1251    # every epoch
+  num_images: 16
+  outlier_ratio: 2.0
+
+register_viz:
+  enabled: true
+  dataset: ImageNetPacked:split=VAL:root=~/datasets/imagenet1k_packed
+  image_size: 224
+  num_images: 8
+  layer: -1
+
+crops:
+  rgb_mean: [0.485, 0.456, 0.406]
+  rgb_std: [0.229, 0.224, 0.225]
+
+wandb:
+  enabled: true
+  project: dinov3-register-classifiers
+  name: vits-im1k-reg4-baseline-avgpool-ra-mixup-100ep
+  group: vits-im1k-avgpool-ra-mixup-100ep
+  tags: [supervised, imagenet1k, vits, reg4, baseline, avgpool-all, randaugment, mixup]
+  mode: online

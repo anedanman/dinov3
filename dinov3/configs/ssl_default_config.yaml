@@ -63,12 +63,18 @@ gram:
   loss_weight_schedule: null  # (dict): If not None, use a schedule for the loss weight instead of `loss_weight`
 train:
   batch_size_per_gpu: 64
+  grad_accum_steps: 1  # number of micro-batches accumulated per optimizer step; effective batch = batch_size_per_gpu * world_size * grad_accum_steps
   dataset_path: ImageNet:split=TRAIN
   data_config: null
   output_dir: .
   saveckp_freq: 20
   seed: 0
   num_workers: 10
+  pin_memory: true
+  prefetch_factor: null
+  persistent_workers: false
+  dataloader_multiprocessing_context: null
+  normalize_on_gpu: false  # ship uint8 crops from the loader and scale/normalize on the GPU (4x less host-RAM batch traffic)
   OFFICIAL_EPOCH_LENGTH: 1250
   monitor_gradient_norm: false
   chunk_schedule: []
@@ -79,8 +85,18 @@ train:
   checkpointing_full: false  # aggressive checkpointing
   compile: true
   cudagraphs: false
+  empty_cuda_cache_after_eval: false
   sharded_eval_checkpoint: false
   cache_dataset: false
+  wandb:
+    enabled: false
+    project: dinov3-registers
+    entity: null
+    name: null  # run name; defaults to output_dir basename
+    group: null
+    tags: []
+    mode: online  # online | offline | disabled
+    log_freq: 10  # log scalar metrics every N steps
 student:
   arch: vit_large
   patch_size: 16
@@ -95,6 +111,20 @@ student:
   ffn_bias: true
   norm_layer: "layernorm"
   n_storage_tokens: 0
+  register_attn_type: standard  # "standard" or "slot" (slot-register competition attention)
+  slot_mode: slot  # "slot" (key-renormalized weighted mean) or "literal" (out = A @ v); only used when register_attn_type=slot
+  register_attn_exclude_cls: true  # For slot attention, registers compete over patches only by default.
+  patch_cls_attn_type: standard  # "standard" or "separate_register_budget" (CLS/patch rows softmax separately over cls+patch keys and register keys)
+  register_to_register_attention: false  # for slot attention, add standard key-softmax register->register attention as an independent branch
+  patch_to_patch_attention: true  # false: patch queries attend only CLS/register keys; requires slot attention from layer 0
+  slot_start_layer: 0  # first block index using slot competition for register rows; earlier blocks fall back to standard register rows (keeping patch_cls_attn_type). 0 = all layers.
+  register_budget_gate: false  # learnable per-head, per-layer multiplier on the separate register budget (init 1 = ungated); requires patch_cls_attn_type=separate_register_budget
+  register_init: learned  # "learned", input-level "gaussian", or mid-depth image-conditioned "predicted_gaussian".
+  register_insert_layer: null  # completed blocks before predicted_gaussian registers are inserted; set slot_start_layer to the same value
+  register_gaussian_std_init: 0.02  # legacy compatibility field; gaussian init mirrors masked_ocl and does not use this value.
+  register_orthogonalize: false  # regularized symmetric (Löwdin) orthogonalization after every block: Y = (XX^T + alpha I)^{-1/2} X
+  register_orth_eps: 1.0e-06  # alpha = eps * mean(diag(XX^T)); larger values trade exact orthogonality for stability near rank deficiency
+  register_orth_preserve_norm: true  # rescale each orthogonalized register back to its pre-orthogonalization norm
   mask_k_bias: false
   untie_cls_and_patch_norms: false  # If true, use separate norms for CLS/reg and patch/mask tokens
   untie_global_and_local_cls_norm: false  # If true, use separate norms for local and global crop CLS token during training
@@ -145,6 +175,15 @@ optim:
   dump_fsdp_weights_path: ""
   adamw_beta1: 0.9
   adamw_beta2: 0.999
+# Step-based scheduling. When `enabled`, training length and all warmups are
+# expressed directly in optimizer steps (not epochs). This is mapped onto the
+# epoch-based machinery by setting train.OFFICIAL_EPOCH_LENGTH = 1.
+schedule:
+  enabled: false
+  total_steps: 100000
+  warmup_steps: 5000
+  freeze_last_layer_steps: 1250
+  teacher_temp_warmup_steps: 18750
 crops:
   global_crops_scale:
   - 0.32
@@ -176,10 +215,122 @@ evaluation:
   config_files:  # Must be in fairvit/eval/configs
     high_freq: benchmark_high_frequency.yaml  # More often
     low_freq: benchmark_low_frequency.yaml  # Less often
+  simple:
+    enabled: false
+    knn:
+      enabled: false
+      period_steps: 10000
+      train_dataset: null  # null = train.dataset_path
+      val_dataset: null  # null = train dataset with split=VAL
+      image_size: 256
+      max_train_images: 40000
+      max_val_images: 10000
+      full_at_end: false
+      full_max_train_images: null  # null = full train split
+      full_max_val_images: null  # null = full val split
+      batch_size: 128
+      num_workers: 4
+      k: 20
+      temperature: 0.07
+      avg_register: true  # also run KNN on mean-pooled register-token features, when registers exist
+      seed: 0
+    linear:
+      enabled: false
+      period_steps: 50000
+      train_dataset: null
+      val_dataset: null
+      image_size: 256
+      max_train_images: 50000
+      max_val_images: 10000
+      batch_size: 128
+      num_workers: 4
+      probe_batch_size: 4096
+      epochs: 10
+      lr: 0.01
+      weight_decay: 0.0
+      seed: 1
+    coco_linear_segmentation:
+      enabled: false
+      period_steps: 50000
+      coco_root: ~/datasets/coco
+      train_split: train2017
+      val_split: val2017
+      image_size: 256
+      max_train_images: 2000
+      max_val_images: 500
+      batch_size: 32
+      num_workers: 4
+      epochs: 3
+      probe_batch_size: 16384  # patches per head-training step (features are cached, epochs are cheap)
+      lr: 0.001
+      weight_decay: 0.0
+      seed: 2
 checkpointing:
   period: 3750
   max_to_keep: 3
   keep_every: 99999999999999999  # Save a checkpoint every N iterations, regardless of max_to_keep and period
+  wandb_upload: false  # upload each keep_every milestone checkpoint to wandb as an artifact
+
+# ---------------------------------------------------------------------------
+# Register-token research extensions (used by dinov3/eval/register_tokens)
+# ---------------------------------------------------------------------------
+register_consistency:
+  enabled: false            # cross-crop register consistency loss (student crop A registers vs teacher crop B registers)
+  loss_weight: 0.1          # weight of the mean (1 - cosine) over matched register pairs
+  matching: hungarian       # "hungarian" (per-image optimal permutation) or "fixed" (index-aligned registers)
+  include_local: false      # also pull student local-crop registers toward teacher global-crop registers
+  warmup_steps: 0           # linear ramp of the loss weight over this many steps (0 = constant)
+  subtract_mean: false      # match mean-subtracted register residuals (raw cosines saturate once registers share a dominant direction)
+
+register_diagnostics:
+  enabled: false            # cheap quantitative register/outlier diagnostics on a fixed image batch
+  every_n_steps: 500
+  num_images: 32            # fixed deterministic batch from `register_viz.dataset`
+  image_size: 256
+  outlier_ratio: 2.0        # patch-norm outlier threshold, as a multiple of the per-image median norm
+  crop_pairs: true          # also measure cross-crop register agreement on two fixed views per image
+
+register_viz:
+  enabled: false
+  every_n_steps: 2500       # render register-attention overlays every N steps
+  num_images: 8             # number of validation images to visualize
+  layer: -1                 # which block's register attention to read (-1 = last)
+  dataset: ImageNetPacked:split=VAL:root=~/datasets/imagenet1k_packed  # source of viz images
+  image_size: 224
+  coco: true                # also render COCO validation panels for MBO variants
+  coco_num_images: null     # null = reuse num_images
+  patch_pca: true                 # PCA-RGB patch-feature panels (joint, bg-removed, per-image)
+  patch_pca_num_images: 16        # dedicated image set for the PCA panels
+  patch_pca_hires_size: 1024      # render the same image set again at this resolution (0 = off)
+
+diffcut:
+  enabled: false
+  every_n_steps: 25000      # DiffCut zero-shot segmentation eval cadence
+  coco_root: ~/datasets/coco
+  split: val2017
+  max_images: 100           # eigendecompositions per image make this pricier than linear probes
+  resolutions: [256, 1024]  # input resolutions; metrics are logged per resolution
+  tau: 0.5                  # recurse while the best normalized-cut value is below tau
+  alpha: 10                 # affinity sharpening exponent on min-max-normalized cosine similarity
+  max_graph_nodes: 1024     # avg-pool the NCut graph down to at most this many patches
+  batch_size: 16            # feature-extraction batch at 256px (scaled down at higher resolutions)
+  viz_num_images: 10        # fixed COCO images rendered as colored segmentation panels
+  viz_display_size: 512     # display resolution of the segmentation panels
+
+mbo:
+  enabled: false
+  every_n_steps: 5000       # compute COCO MBO every N steps
+  coco_root: ~/datasets/coco
+  split: val2017
+  max_images: 2000          # cap for speed; null = all val images
+  image_size: 224
+  layer: -1
+  upsample: bilinear        # how to upsample register attention to image resolution
+  semantic: true            # compute semantic MBO (panoptic stuff+things merged by category)
+  instance: true            # compute instance MBO (per-object masks)
+  # Validation reports register2patch and patch2register masks for:
+  # last, penultimate, all-layer average, second-half-layer average, and
+  # last-layer per-head masks.
 
 # Example of constant schedules with schedules v2
 # # schedules:

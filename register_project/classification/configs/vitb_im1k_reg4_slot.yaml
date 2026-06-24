@@ -1,0 +1,75 @@
+seed: 0
+
+model:
+  arch: vit_base
+  image_size: 224
+  patch_size: 16
+  num_classes: 1000
+  qkv_bias: true
+  drop_path_rate: 0.1
+  layerscale: 1.0e-5
+  n_storage_tokens: 4
+  register_attn_type: slot
+  slot_mode: slot
+  register_attn_exclude_cls: true
+  patch_cls_attn_type: standard
+  register_init: learned
+
+train:
+  dataset: ImageNetPacked:split=TRAIN:root=~/datasets/imagenet1k_packed
+  output_dir: ~/dinov3-runs/vitb-im1k-reg4-slot
+  total_steps: 300000
+  batch_size: 256
+  auto_microbatch: true
+  min_microbatch: 32
+  precision: bf16
+  compile: true
+  num_workers: 8
+  pin_memory: true
+  prefetch_factor: 2
+  persistent_workers: true
+  multiprocessing_context: forkserver
+  log_every_steps: 20
+
+optim:
+  lr: 1.25e-4
+  min_lr: 1.0e-6
+  warmup_steps: 10000
+  weight_decay: 0.05
+  label_smoothing: 0.1
+  clip_grad_norm: 1.0
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+validation:
+  dataset: ImageNetPacked:split=VAL:root=~/datasets/imagenet1k_packed
+  resize_size: 256
+  batch_size: 512
+  num_workers: 4
+  every_n_steps: 20000
+
+checkpointing:
+  keep_every_steps: 100000
+
+register_diagnostics:
+  every_n_steps: 500
+  num_images: 16
+  outlier_ratio: 2.0
+
+register_viz:
+  dataset: ImageNetPacked:split=VAL:root=~/datasets/imagenet1k_packed
+  image_size: 224
+  num_images: 8
+  layer: -1
+
+crops:
+  rgb_mean: [0.485, 0.456, 0.406]
+  rgb_std: [0.229, 0.224, 0.225]
+
+wandb:
+  enabled: true
+  project: dinov3-register-classifiers
+  name: vitb-im1k-reg4-slot-classifier
+  group: vitb-im1k-reg4-classifiers
+  tags: [supervised, imagenet1k, vitb, reg4, slot]
+  mode: online

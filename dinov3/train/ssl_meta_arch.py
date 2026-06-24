@@ -17,7 +17,7 @@ from dinov3.configs import get_default_config
 from dinov3.data import DataAugmentationDINO
 from dinov3.fsdp.ac_compile_parallelize import ac_compile_parallelize
 from dinov3.layers.dino_head import DINOHead
-from dinov3.loss import DINOLoss, GramLoss, KoLeoLoss, KoLeoLossDistributed, iBOTPatchLoss
+from dinov3.loss import DINOLoss, GramLoss, KoLeoLoss, KoLeoLossDistributed, iBOTPatchLoss, register_consistency_loss
 from dinov3.models import build_model_from_cfg
 from dinov3.train.cosine_lr_scheduler import linear_warmup_cosine_decay
 from dinov3.train.param_groups import fuse_params_groups, get_params_groups_with_decay_fsdp
@@ -138,6 +138,10 @@ class SSLMetaArch(nn.Module):
         self.model_ema.requires_grad_(False)
         self.ema_params_lists = None
 
+        # Lazily-created GPU normalization constants for uint8 crops (`train.normalize_on_gpu`).
+        self._gpu_normalize_scale = None
+        self._gpu_normalize_shift = None
+
         # getting config params fixed:
         self.n_local_crops = self.cfg.crops.local_crops_number
         self.is_distillation_enabled = self.cfg.distillation.enabled
@@ -145,6 +149,22 @@ class SSLMetaArch(nn.Module):
         self.dino_loss_weight = self.cfg.dino.loss_weight
         self.dino_koleo_loss_weight = self.cfg.dino.koleo_loss_weight
         self.ibot_loss_weight = self.cfg.ibot.loss_weight
+
+        # Cross-crop register consistency loss
+        rc_cfg = self.cfg.get("register_consistency", None)
+        self.register_consistency_enabled = bool(rc_cfg and rc_cfg.enabled and cfg.student.n_storage_tokens > 0)
+        if self.register_consistency_enabled:
+            self.register_consistency_weight = float(rc_cfg.loss_weight)
+            self.register_consistency_matching = str(rc_cfg.get("matching", "hungarian"))
+            self.register_consistency_include_local = bool(rc_cfg.get("include_local", False))
+            self.register_consistency_warmup_steps = int(rc_cfg.get("warmup_steps", 0))
+            self.register_consistency_subtract_mean = bool(rc_cfg.get("subtract_mean", False))
+            logger.info("OPTIONS -- REGISTER CONSISTENCY")
+            logger.info(f"OPTIONS -- REGISTER CONSISTENCY -- loss_weight: {self.register_consistency_weight}")
+            logger.info(f"OPTIONS -- REGISTER CONSISTENCY -- matching: {self.register_consistency_matching}")
+            logger.info(f"OPTIONS -- REGISTER CONSISTENCY -- include_local: {self.register_consistency_include_local}")
+            logger.info(f"OPTIONS -- REGISTER CONSISTENCY -- warmup_steps: {self.register_consistency_warmup_steps}")
+            logger.info(f"OPTIONS -- REGISTER CONSISTENCY -- subtract_mean: {self.register_consistency_subtract_mean}")
 
         # Local loss reweighting
         if self.cfg.dino.reweight_dino_local_loss:
@@ -352,8 +372,36 @@ class SSLMetaArch(nn.Module):
                 self.teacher.ibot_head.init_weights()
             logger.info(f"Performing distillation from: {self.teacher}")
 
+    def _maybe_gpu_normalize(self, crops: Tensor) -> Tensor:
+        """Scale + mean/std-normalize uint8 crops on the GPU.
+
+        Used with ``train.normalize_on_gpu``: the loader ships uint8 crops (4x
+        less shared/pinned host memory and IPC traffic than bf16/fp32), and the
+        normalization runs here in the compute dtype.
+        """
+        if crops.dtype != torch.uint8:
+            return crops
+        if self._gpu_normalize_scale is None or self._gpu_normalize_scale.device != crops.device:
+            mean = torch.as_tensor(list(self.cfg.crops.rgb_mean), device=crops.device, dtype=torch.float32)
+            std = torch.as_tensor(list(self.cfg.crops.rgb_std), device=crops.device, dtype=torch.float32)
+            # x / 255 / std - mean / std, folded into a fused multiply-add
+            self._gpu_normalize_scale = (1.0 / (255.0 * std)).reshape(1, 3, 1, 1)
+            self._gpu_normalize_shift = (-mean / std).reshape(1, 3, 1, 1)
+        dtype = {
+            "fp32": torch.float32,
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+        }[self.cfg.compute_precision.param_dtype]
+        # Normalize in fp32 and only then cast, matching the precision of the
+        # loader-side `normalize -> collate cast` pipeline bit-for-bit.
+        return torch.addcmul(
+            self._gpu_normalize_shift,
+            crops.to(torch.float32),
+            self._gpu_normalize_scale,
+        ).to(dtype)
+
     def forward_backward(
-        self, data, *, teacher_temp, iteration=0, **ignored_kwargs
+        self, data, *, teacher_temp, iteration=0, loss_scale: float = 1.0, **ignored_kwargs
     ) -> tuple[Tensor, dict[str, float | Tensor]]:
         del ignored_kwargs
         metrics_dict = {}
@@ -366,8 +414,8 @@ class SSLMetaArch(nn.Module):
         metrics_dict["local_batch_size"] = B
         metrics_dict["global_batch_size"] = data["global_batch_size"]
 
-        global_crops = data["collated_global_crops"].cuda(non_blocking=True)
-        local_crops = data["collated_local_crops"].cuda(non_blocking=True)
+        global_crops = self._maybe_gpu_normalize(data["collated_global_crops"].cuda(non_blocking=True))
+        local_crops = self._maybe_gpu_normalize(data["collated_local_crops"].cuda(non_blocking=True))
         masks = data["collated_masks"].cuda(non_blocking=True)
         mask_indices_list = data["mask_indices_list"].cuda(non_blocking=True)
         masks_weight = data["masks_weight"].cuda(non_blocking=True)
@@ -377,7 +425,7 @@ class SSLMetaArch(nn.Module):
             assert "collated_gram_teacher_crops" in data, (
                 "no gram teacher crops in the data, have you set cfg.crops.gram_teacher_crops_size?"
             )
-            gram_teacher_crops = data["collated_gram_teacher_crops"].cuda(non_blocking=True)
+            gram_teacher_crops = self._maybe_gpu_normalize(data["collated_gram_teacher_crops"].cuda(non_blocking=True))
         else:
             gram_teacher_crops = None
 
@@ -423,7 +471,9 @@ class SSLMetaArch(nn.Module):
             iteration=iteration,
         )
 
-        self.backprop_loss(loss_accumulator)
+        # Scale the loss for gradient accumulation (grads from `1/loss_scale`
+        # micro-batches sum to the full-batch average). Reported loss stays unscaled.
+        self.backprop_loss(loss_accumulator if loss_scale == 1.0 else loss_accumulator * loss_scale)
 
         # Return total weighted loss and a dict of metrics to log
         return loss_accumulator, metrics_dict | loss_dict
@@ -637,6 +687,35 @@ class SSLMetaArch(nn.Module):
         loss_dict["koleo_loss"] = koleo_loss
         loss_accumulator += self.dino_koleo_loss_weight * koleo_scale * koleo_loss
 
+        # Cross-crop register consistency: student registers of one global crop
+        # match (Hungarian) the teacher registers of the other global crop.
+        if self.register_consistency_enabled:
+            rc_loss = register_consistency_loss(
+                student_global["reg_pre_head"],
+                teacher_global["reg_pre_head"],
+                matching=self.register_consistency_matching,
+                subtract_mean=self.register_consistency_subtract_mean,
+            )
+            if self.register_consistency_include_local:
+                n_teacher = teacher_global["reg_pre_head"].shape[0]
+                local_pairs = [(i, j) for i in range(n_local_crops) for j in range(n_teacher)]
+                rc_loss = 0.5 * rc_loss + 0.5 * register_consistency_loss(
+                    student_local["reg_pre_head"],
+                    teacher_global["reg_pre_head"],
+                    matching=self.register_consistency_matching,
+                    pairs=local_pairs,
+                    subtract_mean=self.register_consistency_subtract_mean,
+                )
+            if self.register_consistency_warmup_steps > 0:
+                rc_weight = self.register_consistency_weight * min(
+                    1.0, (iteration + 1) / self.register_consistency_warmup_steps
+                )
+            else:
+                rc_weight = self.register_consistency_weight
+            loss_dict["register_consistency_loss"] = rc_loss
+            loss_dict["register_consistency_weight"] = rc_weight
+            loss_accumulator += rc_weight * rc_loss
+
         # IBOT loss
         ibot_patch_loss = self.ibot_patch_loss.forward_masked(
             student_global["masked_patch_after_head"],
@@ -758,6 +837,7 @@ class SSLMetaArch(nn.Module):
             horizontal_flips=cfg.crops.horizontal_flips,
             mean=cfg.crops.rgb_mean,
             std=cfg.crops.rgb_std,
+            normalize_in_loader=not cfg.train.get("normalize_on_gpu", False),
         )
 
     def get_maybe_fused_params_for_submodel(self, m: nn.Module):

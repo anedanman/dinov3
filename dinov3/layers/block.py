@@ -36,6 +36,11 @@ class SelfAttentionBlock(nn.Module):
         attn_class: Callable[..., nn.Module] = SelfAttention,
         ffn_layer: Callable[..., nn.Module] = Mlp,
         mask_k_bias: bool = False,
+        covariance_mode: str = "none",
+        covariance_space: str = "value",
+        covariance_normalization: str = "relative_second_moment",
+        covariance_eps: float = 1e-6,
+        covariance_gate_strength: float = 0.6931471805599453,
         device=None,
     ) -> None:
         super().__init__()
@@ -49,6 +54,11 @@ class SelfAttentionBlock(nn.Module):
             attn_drop=attn_drop,
             proj_drop=drop,
             mask_k_bias=mask_k_bias,
+            covariance_mode=covariance_mode,
+            covariance_space=covariance_space,
+            covariance_normalization=covariance_normalization,
+            covariance_eps=covariance_eps,
+            covariance_gate_strength=covariance_gate_strength,
             device=device,
         )
         self.ls1 = LayerScale(dim, init_values=init_values, device=device) if init_values else nn.Identity()

@@ -43,13 +43,16 @@ def apply_scaling_rules_to_cfg(cfg):  # to fix
         # For schedules v2, the scaling rules are applied when building the schedules, the config is not modified
         return cfg
 
+    # Scale by the EFFECTIVE batch size (includes gradient accumulation).
+    grad_accum = max(1, int(cfg.train.get("grad_accum_steps", 1)))
+    effective_batch = cfg.train.batch_size_per_gpu * distributed.get_world_size() * grad_accum
     if cfg.optim.scaling_rule == "linear_wrt_256":
         old_lr = cfg.optim.lr
-        cfg.optim.lr *= cfg.train.batch_size_per_gpu * distributed.get_world_size() / 256.0
+        cfg.optim.lr *= effective_batch / 256.0
         logger.info(f"linear scaling learning rate; old: {old_lr}, new: {cfg.optim.lr}")
     elif cfg.optim.scaling_rule == "sqrt_wrt_1024":
         old_lr = cfg.optim.lr
-        cfg.optim.lr *= 4 * math.sqrt(cfg.train.batch_size_per_gpu * distributed.get_world_size() / 1024.0)
+        cfg.optim.lr *= 4 * math.sqrt(effective_batch / 1024.0)
         logger.info(f"sqrt scaling learning rate; old: {old_lr}, new: {cfg.optim.lr}")
     return cfg
 

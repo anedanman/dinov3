@@ -7,6 +7,21 @@ import random
 
 import torch
 
+from dinov3.utils.memory import PeriodicMemoryTrimmer
+
+_COLLATE_TRIMMER = PeriodicMemoryTrimmer("DINOV3_COLLATE_MALLOC_TRIM_EVERY", 16)
+
+
+def _stack_and_cast(tensors, dtype):
+    """Stack tensors while avoiding a large temporary stack in the source dtype."""
+    first = tensors[0]
+    if first.dtype == dtype:
+        return torch.stack(tensors)
+
+    out = torch.empty((len(tensors), *first.shape), dtype=dtype)
+    torch.stack(tensors, out=out)
+    return out
+
 
 def collate_data_and_cast(
     samples_list,
@@ -21,14 +36,15 @@ def collate_data_and_cast(
     n_global_crops = len(samples_list[0][0]["global_crops"])
     n_local_crops = len(samples_list[0][0]["local_crops"])
 
-    collated_global_crops = torch.stack(
-        [s[0]["global_crops"][i] for i in range(n_global_crops) for s in samples_list]
-    )  # [n_global_crops, B, ...]
-    collated_local_crops = torch.stack([s[0]["local_crops"][i] for i in range(n_local_crops) for s in samples_list])
+    global_crop_tensors = [s[0]["global_crops"][i] for i in range(n_global_crops) for s in samples_list]
+    local_crop_tensors = [s[0]["local_crops"][i] for i in range(n_local_crops) for s in samples_list]
+    collated_global_crops = _stack_and_cast(global_crop_tensors, dtype)  # [n_global_crops, B, ...]
+    collated_local_crops = _stack_and_cast(local_crop_tensors, dtype)
+    del global_crop_tensors, local_crop_tensors
     if "gram_teacher_crops" in samples_list[0][0]:
-        collated_gram_teacher_crops = torch.stack(
-            [s[0]["gram_teacher_crops"][i] for i in range(n_global_crops) for s in samples_list]
-        )  # [n_global_crops, B, ...]
+        gram_crop_tensors = [s[0]["gram_teacher_crops"][i] for i in range(n_global_crops) for s in samples_list]
+        collated_gram_teacher_crops = _stack_and_cast(gram_crop_tensors, dtype)  # [n_global_crops, B, ...]
+        del gram_crop_tensors
     else:
         collated_gram_teacher_crops = None
 
@@ -65,8 +81,8 @@ def collate_data_and_cast(
     masks_weight = (1 / collated_masks.sum(-1).clamp(min=1.0)).unsqueeze(-1).expand_as(collated_masks)[collated_masks]
 
     out = {
-        "collated_global_crops": collated_global_crops.to(dtype),
-        "collated_local_crops": collated_local_crops.to(dtype),
+        "collated_global_crops": collated_global_crops,
+        "collated_local_crops": collated_local_crops,
         "collated_masks": collated_masks,
         "mask_indices_list": mask_indices_list,
         "masks_weight": masks_weight,
@@ -74,7 +90,9 @@ def collate_data_and_cast(
         "n_masked_patches": torch.full((1,), fill_value=mask_indices_list.shape[0], dtype=torch.long),
     }
     if collated_gram_teacher_crops is not None:
-        out["collated_gram_teacher_crops"] = collated_gram_teacher_crops.to(dtype)
+        out["collated_gram_teacher_crops"] = collated_gram_teacher_crops
+    del masks_list
+    _COLLATE_TRIMMER.maybe_trim()
     return out
 
 
