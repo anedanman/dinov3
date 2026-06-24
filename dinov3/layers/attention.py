@@ -4,12 +4,20 @@
 # the terms of the DINOv3 License Agreement.
 
 import math
+from contextlib import nullcontext
 from typing import List, Tuple
 
 import torch
 import torch.nn.functional as F
 from dinov3.utils import cat_keep_shapes, uncat_with_shapes
 from torch import Tensor, nn
+try:
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+except ImportError:  # PyTorch < 2.5; backend selection is only a performance hint.
+    SDPBackend = None
+
+    def sdpa_kernel(*args, **kwargs):
+        return nullcontext()
 
 
 # RoPE-related functions:
@@ -50,18 +58,42 @@ class SelfAttention(nn.Module):
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
         mask_k_bias: bool = False,
+        covariance_mode: str = "none",
+        covariance_space: str = "value",
+        covariance_normalization: str = "relative_second_moment",
+        covariance_eps: float = 1e-6,
+        covariance_gate_strength: float = math.log(2.0),
         device=None,
     ) -> None:
         super().__init__()
+        assert covariance_mode in ("none", "gate", "add"), f"unknown covariance_mode={covariance_mode}"
+        assert covariance_space in ("key", "value"), f"unknown covariance_space={covariance_space}"
+        assert covariance_normalization in ("raw", "relative_second_moment"), (
+            f"unknown covariance_normalization={covariance_normalization}"
+        )
+        assert covariance_eps > 0, "covariance_eps must be positive"
+        assert covariance_gate_strength >= 0, "covariance_gate_strength must be non-negative"
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = head_dim**-0.5
+        self.covariance_mode = covariance_mode
+        self.covariance_space = covariance_space
+        self.covariance_normalization = covariance_normalization
+        self.covariance_eps = covariance_eps
+        self.covariance_gate_strength = covariance_gate_strength
 
         linear_class = LinearKMaskedBias if mask_k_bias else nn.Linear
         self.qkv = linear_class(dim, dim * 3, bias=qkv_bias, device=device)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim, bias=proj_bias, device=device)
         self.proj_drop = nn.Dropout(proj_drop)
+        if covariance_mode == "add":
+            self.covariance_proj = nn.Linear(dim, dim, bias=False, device=device)
+            # DinoVisionTransformer.init_weights handles this marker after its
+            # generic Linear initialization, preserving the baseline at step 0.
+            self.covariance_proj._zero_init = True
+        else:
+            self.covariance_proj = None
 
     def apply_rope(self, q: Tensor, k: Tensor, rope: Tensor | Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
         # All operations will use the dtype of rope, the output is cast back to the dtype of q and k
@@ -113,7 +145,36 @@ class SelfAttention(nn.Module):
         q, k, v = [t.transpose(1, 2) for t in [q, k, v]]
         if rope is not None:
             q, k = self.apply_rope(q, k, rope)
-        x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        x = F.scaled_dot_product_attention(q, k, v, scale=self.scale)
+        if self.covariance_mode != "none":
+            covariance_source = k if self.covariance_space == "key" else v
+            covariance_mean = (
+                F.scaled_dot_product_attention(q, k, covariance_source, scale=self.scale)
+                if self.covariance_space == "key"
+                else x
+            )
+            covariance_second_moment = F.scaled_dot_product_attention(
+                q, k, covariance_source.square(), scale=self.scale
+            )
+
+            # The fused attention calls stay in the training dtype; perform the
+            # cancellation-sensitive subtraction and normalization in fp32.
+            covariance_mean_fp32 = covariance_mean.float()
+            second_moment_fp32 = covariance_second_moment.float()
+            covariance = (second_moment_fp32 - covariance_mean_fp32.square()).clamp_min_(0.0)
+            if self.covariance_normalization == "relative_second_moment":
+                covariance = (
+                    covariance / second_moment_fp32.clamp_min(self.covariance_eps)
+                ).clamp_(0.0, 1.0)
+
+            if self.covariance_mode == "gate":
+                gate = torch.exp(-self.covariance_gate_strength * covariance)
+                x = x * gate.to(x.dtype)
+            else:
+                covariance_flat = covariance.transpose(1, 2).reshape(B, N, C).to(x.dtype)
+                covariance_update = self.covariance_proj(covariance_flat)
+                x_flat = x.transpose(1, 2).reshape(B, N, C)
+                return x_flat + covariance_update
         x = x.transpose(1, 2)
         return x.reshape([B, N, C])
 
@@ -202,6 +263,40 @@ def compute_patch_cls_separate_register_budget(
     return out_nonreg + out_reg
 
 
+def compute_patch_cls_without_patch_to_patch(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    n_storage_tokens: int,
+    scale: float,
+) -> Tensor:
+    """CLS/patch outputs for bipartite register-patch attention.
+
+    CLS attends to every token with a single key-softmax. Patch queries use one
+    normalized softmax over the combined ``[CLS, registers]`` key set and never
+    see patch keys.
+
+    This decomposition avoids a dense ``P x P`` mask and never materializes
+    patch-to-patch logits. Its dominant attention cost is ``O(P * R)``.
+    Returned rows are ordered ``[CLS, patches]``.
+    """
+    R = n_storage_tokens
+    q_cls = q[:, :, :1, :]
+    q_patch = q[:, :, 1 + R :, :]
+    out_cls = F.scaled_dot_product_attention(q_cls, k, v, scale=scale)
+    patch_k = k[:, :, : 1 + R, :]
+    patch_v = v[:, :, : 1 + R, :]
+    if q_patch.is_cuda and q_patch.dtype in (torch.float16, torch.bfloat16):
+        # For the very rectangular P x (1+R) problem, memory-efficient SDPA is
+        # faster than FlashAttention and custom Triton kernels on current GPUs.
+        backend = SDPBackend.EFFICIENT_ATTENTION if SDPBackend is not None else None
+        with sdpa_kernel(backend):
+            out_patch = F.scaled_dot_product_attention(q_patch, patch_k, patch_v, scale=scale)
+    else:
+        out_patch = F.scaled_dot_product_attention(q_patch, patch_k, patch_v, scale=scale)
+    return torch.cat([out_cls, out_patch], dim=-2)
+
+
 @torch.no_grad()
 def extract_register_attention_maps(
     qkv: Tensor,
@@ -214,6 +309,7 @@ def extract_register_attention_maps(
     slot_renorm: bool = True,
     slot_exclude_cls: bool = True,
     patch_cls_attn_type: str = "standard",
+    patch_to_patch_attention: bool = True,
     direction: str = "register_to_patch",
 ) -> Tuple[Tensor, Tensor]:
     """Compute register masks and the matching CLS map for viz / MBO.
@@ -265,7 +361,10 @@ def extract_register_attention_maps(
             masks = attn[:, :, :, 1 + R :]  # patch columns -> [B,h,R,P]
 
         q_cls = q[:, :, :1, :].float()
-        if patch_cls_attn_type == "separate_register_budget":
+        if not patch_to_patch_attention:
+            cls_logits = torch.matmul(q_cls, k.float().transpose(-2, -1)) * scale
+            cls_map = torch.softmax(cls_logits, dim=-1)[:, :, 0, 1 + R :]
+        elif patch_cls_attn_type == "separate_register_budget":
             k_nonreg = torch.cat([k[:, :, :1, :], k[:, :, 1 + R :, :]], dim=-2).float()
             cls_logits = torch.matmul(q_cls, k_nonreg.transpose(-2, -1)) * scale  # [B,h,1,1+P]
             cls_map = torch.softmax(cls_logits, dim=-1)[:, :, 0, 1:]  # [B,h,P]
@@ -275,17 +374,27 @@ def extract_register_attention_maps(
         return masks, cls_map
 
     q_patch = q[:, :, 1 + R :, :].float()  # [B,h,P,d]
-    if patch_cls_attn_type == "separate_register_budget":
+    if not patch_to_patch_attention:
+        prefix_logits = torch.matmul(q_patch, k[:, :, : 1 + R, :].float().transpose(-2, -1)) * scale
+        prefix_attn = torch.softmax(prefix_logits, dim=-1)
+        masks = prefix_attn[:, :, :, 1:].transpose(-2, -1)
+        cls_map = prefix_attn[:, :, :, 0]
+    elif patch_cls_attn_type == "separate_register_budget":
         k_reg = k[:, :, 1 : 1 + R, :].float()
         reg_logits = torch.matmul(q_patch, k_reg.transpose(-2, -1)) * scale  # [B,h,P,R]
         reg_attn = torch.softmax(reg_logits, dim=-1)
         masks = reg_attn.transpose(-2, -1)  # [B,h,R,P]
 
-        k_nonreg = torch.cat([k[:, :, :1, :], k[:, :, 1 + R :, :]], dim=-2).float()
-        nonreg_logits = torch.matmul(q_patch, k_nonreg.transpose(-2, -1)) * scale  # [B,h,P,1+P]
-        cls_map = torch.softmax(nonreg_logits, dim=-1)[:, :, :, 0]  # patch->cls, [B,h,P]
+        if patch_to_patch_attention:
+            k_nonreg = torch.cat([k[:, :, :1, :], k[:, :, 1 + R :, :]], dim=-2).float()
+            nonreg_logits = torch.matmul(q_patch, k_nonreg.transpose(-2, -1)) * scale  # [B,h,P,1+P]
+            cls_map = torch.softmax(nonreg_logits, dim=-1)[:, :, :, 0]  # patch->cls, [B,h,P]
+        else:
+            # The separate non-register budget contains only the CLS key.
+            cls_map = torch.ones_like(reg_attn[:, :, :, 0])
     else:
-        logits = torch.matmul(q_patch, k.float().transpose(-2, -1)) * scale  # [B,h,P,N]
+        patch_keys = k if patch_to_patch_attention else k[:, :, : 1 + R, :]
+        logits = torch.matmul(q_patch, patch_keys.float().transpose(-2, -1)) * scale
         attn = torch.softmax(logits, dim=-1)
         masks = attn[:, :, :, 1 : 1 + R].transpose(-2, -1)  # [B,h,R,P]
         cls_map = attn[:, :, :, 0]  # patch->cls, [B,h,P]
@@ -305,6 +414,7 @@ def extract_register_patch_attention(
     slot_renorm: bool = True,
     slot_exclude_cls: bool = True,
     patch_cls_attn_type: str = "standard",
+    patch_to_patch_attention: bool = True,
 ) -> Tensor:
     """Compute register->patch attention weights for visualization / MBO masks."""
     masks, _ = extract_register_attention_maps(
@@ -318,6 +428,7 @@ def extract_register_patch_attention(
         slot_renorm=slot_renorm,
         slot_exclude_cls=slot_exclude_cls,
         patch_cls_attn_type=patch_cls_attn_type,
+        patch_to_patch_attention=patch_to_patch_attention,
         direction="register_to_patch",
     )
     return masks
@@ -387,6 +498,15 @@ class RegisterSlotAttention(SelfAttention):
     ``patch_cls_attn_type`` optionally changes CLS/patch rows to give registers
     their own independent key-softmax budget; ``register_budget_gate`` adds a
     learnable per-head multiplier on that budget (init 1 = ungated behaviour).
+
+    If ``register_to_register_attention`` is true, register query rows also get
+    an independent standard-attention branch over register keys. This branch
+    uses the usual key-softmax (not slot competition) and is added to the
+    slot-style register-to-patch output.
+
+    If ``patch_to_patch_attention`` is false, patch query rows use only CLS and
+    register keys through an ``O(P * R)`` SDPA decomposition; CLS still reads all
+    tokens and register rows keep the competition behavior above.
     """
 
     def __init__(
@@ -397,6 +517,8 @@ class RegisterSlotAttention(SelfAttention):
         exclude_cls: bool = True,
         patch_cls_attn_type: str = "standard",
         register_budget_gate: bool = False,
+        register_to_register_attention: bool = False,
+        patch_to_patch_attention: bool = True,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -413,6 +535,8 @@ class RegisterSlotAttention(SelfAttention):
         self.slot_renorm = slot_mode == "slot"
         self.exclude_cls = exclude_cls
         self.patch_cls_attn_type = patch_cls_attn_type
+        self.register_to_register_attention = register_to_register_attention
+        self.patch_to_patch_attention = patch_to_patch_attention
         if register_budget_gate:
             device = self.qkv.weight.device
             self.reg_budget_gate = nn.Parameter(torch.empty(self.num_heads, device=device))
@@ -434,7 +558,15 @@ class RegisterSlotAttention(SelfAttention):
         q, k, v = [t.transpose(1, 2) for t in [q, k, v]]
         if rope is not None:
             q, k = self.apply_rope(q, k, rope)
-        if self.patch_cls_attn_type == "separate_register_budget":
+        if not self.patch_to_patch_attention:
+            patch_cls_rows = compute_patch_cls_without_patch_to_patch(
+                q,
+                k,
+                v,
+                R,
+                self.scale,
+            )
+        elif self.patch_cls_attn_type == "separate_register_budget":
             patch_cls_rows = compute_patch_cls_separate_register_budget(
                 q, k, v, R, self.scale, gate=self._register_budget_gate(v.dtype)
             )
@@ -443,6 +575,14 @@ class RegisterSlotAttention(SelfAttention):
             q_nonreg = torch.cat([q[:, :, :1, :], q[:, :, 1 + R :, :]], dim=-2)
             patch_cls_rows = F.scaled_dot_product_attention(q_nonreg, k, v, scale=self.scale)
         out_reg = compute_register_competition(q, k, v, R, self.scale, self.slot_renorm, self.exclude_cls)
+        if self.register_to_register_attention:
+            reg_slice = slice(1, 1 + R)
+            out_reg = out_reg + F.scaled_dot_product_attention(
+                q[:, :, reg_slice, :],
+                k[:, :, reg_slice, :],
+                v[:, :, reg_slice, :],
+                scale=self.scale,
+            )
         x = torch.cat([patch_cls_rows[:, :, :1, :], out_reg, patch_cls_rows[:, :, 1:, :]], dim=-2)
         x = x.transpose(1, 2)
         return x.reshape([B, N, C])

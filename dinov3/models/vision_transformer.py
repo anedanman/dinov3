@@ -4,6 +4,7 @@
 # the terms of the DINOv3 License Agreement.
 
 import logging
+import math
 from functools import partial
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
@@ -49,12 +50,84 @@ dtype_dict = {
 }
 
 
+class _RegularizedLowdin(torch.autograd.Function):
+    """Regularized row-orthogonalization with a stable first-order derivative.
+
+    ``torch.linalg.eigh`` is safe in the forward pass, but its generic backward
+    differentiates the eigenvectors and is undefined when eigenvalues repeat.
+    The inverse-square-root matrix function itself does not have that problem.
+    Its Fréchet derivative is evaluated below with the analytic divided
+    difference of ``f(t) = t**-1/2``, which has no eigenvalue-gap denominator.
+    """
+
+    @staticmethod
+    def forward(ctx, x: Tensor, eps: float) -> Tensor:
+        input_dtype = x.dtype
+        x64 = x.double()
+        gram = x64 @ x64.transpose(-1, -2)
+        raw_scale = gram.diagonal(dim1=-2, dim2=-1).mean(-1)
+        scale_active = raw_scale > 1e-24
+        scale = raw_scale.clamp_min(1e-24)
+        ridge = float(eps) * scale
+        eye = torch.eye(x.shape[-2], device=x.device, dtype=torch.float64)
+        evals, evecs = torch.linalg.eigh(gram + ridge[:, None, None] * eye)
+        sqrt_evals = evals.clamp_min(1e-30).sqrt()
+        proj = (evecs * sqrt_evals.reciprocal()[:, None, :]) @ evecs.transpose(-1, -2)
+        out = proj @ x64
+
+        # Training calls this function with fp32 registers. Keeping the spectral
+        # factors in fp32 makes the backward cheap on GPUs with slow fp64 while
+        # retaining fp64 where it matters: resolving the forward Gram spectrum.
+        # A float64 input (for gradcheck or scientific use) keeps float64 state.
+        ctx.eps = float(eps)
+        ctx.save_for_backward(
+            x,
+            sqrt_evals.to(input_dtype),
+            evecs.to(input_dtype),
+            proj.to(input_dtype),
+            scale_active,
+        )
+        return out.to(input_dtype)
+
+    @staticmethod
+    def backward(ctx, grad_out: Tensor):
+        x, sqrt_evals, evecs, proj, scale_active = ctx.saved_tensors
+        grad = grad_out.to(x.dtype)
+
+        # If P=A^-1/2 and Y=PX, the indirect term is obtained from the
+        # self-adjoint Fréchet derivative of f(A)=A^-1/2. For eigenvalues a,b,
+        # (f(a)-f(b))/(a-b) has the stable closed form below, including a=b.
+        cross = 0.5 * (
+            grad @ x.transpose(-1, -2) + x @ grad.transpose(-1, -2)
+        )
+        cross_eigen = evecs.transpose(-1, -2) @ cross @ evecs
+        si = sqrt_evals[:, :, None]
+        sj = sqrt_evals[:, None, :]
+        divided_difference = -(si * sj * (si + sj)).reciprocal()
+        frechet = evecs @ (divided_difference * cross_eigen) @ evecs.transpose(-1, -2)
+
+        grad_x = proj @ grad + 2.0 * (frechet @ x)
+        # The relative ridge is eps * trace(XX^T) / R, so it also contributes
+        # through X. The clamp is inactive for every nonzero register set.
+        ridge_grad = (2.0 * ctx.eps / x.shape[-2]) * frechet.diagonal(dim1=-2, dim2=-1).sum(-1)
+        ridge_grad = ridge_grad * scale_active.to(ridge_grad.dtype)
+        grad_x = grad_x + ridge_grad[:, None, None] * x
+        return grad_x, None
+
+
+def _regularized_lowdin(x: Tensor, eps: float) -> Tensor:
+    return _RegularizedLowdin.apply(x, eps)
+
+
 def init_weights_vit(module: nn.Module, name: str = ""):
     if getattr(module, "reg_budget_gate", None) is not None:
         # Learnable register-budget gate: start at 1 (exactly ungated behaviour).
         nn.init.ones_(module.reg_budget_gate)
     if isinstance(module, nn.Linear):
-        torch.nn.init.trunc_normal_(module.weight, std=0.02)
+        if getattr(module, "_zero_init", False):
+            nn.init.zeros_(module.weight)
+        else:
+            torch.nn.init.trunc_normal_(module.weight, std=0.02)
         if module.bias is not None:
             nn.init.zeros_(module.bias)
         if hasattr(module, "bias_mask") and module.bias_mask is not None:
@@ -105,13 +178,21 @@ class DinoVisionTransformer(nn.Module):
         slot_mode: str = "slot",
         register_attn_exclude_cls: bool = True,
         patch_cls_attn_type: str = "standard",
+        register_to_register_attention: bool = False,
+        patch_to_patch_attention: bool = True,
         slot_start_layer: int = 0,
         register_budget_gate: bool = False,
         register_init: str = "learned",
+        register_insert_layer: int | None = None,
         register_gaussian_std_init: float = 0.02,
         register_orthogonalize: bool = False,
         register_orth_eps: float = 1e-6,
         register_orth_preserve_norm: bool = True,
+        covariance_mode: str = "none",
+        covariance_space: str = "value",
+        covariance_normalization: str = "relative_second_moment",
+        covariance_eps: float = 1e-6,
+        covariance_gate_strength: float = math.log(2.0),
         device: Any | None = None,
         **ignored_kwargs,
     ):
@@ -137,11 +218,25 @@ class DinoVisionTransformer(nn.Module):
 
         self.cls_token = nn.Parameter(torch.empty(1, 1, embed_dim, device=device))
         self.n_storage_tokens = n_storage_tokens
-        assert register_init in ("learned", "gaussian"), f"unknown register_init={register_init}"
+        assert register_init in ("learned", "gaussian", "predicted_gaussian"), f"unknown register_init={register_init}"
         assert register_gaussian_std_init > 0, "register_gaussian_std_init must be positive"
         self.register_init = register_init
+        self.register_insert_layer = register_insert_layer
         self.register_gaussian_std_init = register_gaussian_std_init
-        if self.n_storage_tokens > 0:
+        if self.register_init == "predicted_gaussian":
+            assert self.n_storage_tokens > 0, "predicted_gaussian requires register tokens"
+            assert register_insert_layer is not None and 0 < register_insert_layer < depth, (
+                "predicted_gaussian requires 0 < register_insert_layer < depth"
+            )
+            self.register_predictor = Mlp(
+                in_features=embed_dim,
+                hidden_features=embed_dim,
+                out_features=2 * embed_dim,
+                act_layer=nn.GELU,
+                bias=True,
+                device=device,
+            )
+        elif self.n_storage_tokens > 0:
             n_storage_token_params = 1 if self.register_init == "gaussian" else n_storage_tokens
             self.storage_tokens = nn.Parameter(torch.empty(1, n_storage_token_params, embed_dim, device=device))
             if self.register_init == "gaussian":
@@ -175,6 +270,9 @@ class DinoVisionTransformer(nn.Module):
 
         # Register-token attention behaviour.
         assert register_attn_type in ("standard", "slot"), f"unknown register_attn_type={register_attn_type}"
+        assert not register_to_register_attention or register_attn_type == "slot", (
+            "register_to_register_attention is only an additional branch for slot attention"
+        )
         assert patch_cls_attn_type in ("standard", "separate_register_budget"), (
             f"unknown patch_cls_attn_type={patch_cls_attn_type}"
         )
@@ -182,14 +280,49 @@ class DinoVisionTransformer(nn.Module):
         assert not register_budget_gate or patch_cls_attn_type == "separate_register_budget", (
             "register_budget_gate requires patch_cls_attn_type='separate_register_budget'"
         )
+        assert patch_to_patch_attention or (register_attn_type == "slot" and slot_start_layer == 0), (
+            "disabling patch-to-patch attention currently requires slot attention from layer 0"
+        )
+        if register_init == "predicted_gaussian":
+            assert register_attn_type == "slot", "predicted_gaussian requires slot register attention"
+            assert slot_start_layer == register_insert_layer, (
+                "slot_start_layer must equal register_insert_layer for predicted_gaussian"
+            )
         self.register_attn_type = register_attn_type
         self.slot_mode = slot_mode
         self.register_attn_exclude_cls = register_attn_exclude_cls
         self.patch_cls_attn_type = patch_cls_attn_type
+        self.register_to_register_attention = register_to_register_attention
+        self.patch_to_patch_attention = patch_to_patch_attention
         self.slot_start_layer = slot_start_layer
         self.register_budget_gate = register_budget_gate
+        assert covariance_mode in ("none", "gate", "add"), f"unknown covariance_mode={covariance_mode}"
+        assert covariance_space in ("key", "value"), f"unknown covariance_space={covariance_space}"
+        assert covariance_normalization in ("raw", "relative_second_moment"), (
+            f"unknown covariance_normalization={covariance_normalization}"
+        )
+        assert covariance_eps > 0, "covariance_eps must be positive"
+        assert covariance_gate_strength >= 0, "covariance_gate_strength must be non-negative"
+        if covariance_mode != "none":
+            assert register_attn_type == "standard" and patch_cls_attn_type == "standard", (
+                "covariance attention currently supports standard self-attention only"
+            )
+            logger.info(
+                "using attention covariance mode=%s space=%s normalization=%s eps=%g gate_strength=%g",
+                covariance_mode,
+                covariance_space,
+                covariance_normalization,
+                covariance_eps,
+                covariance_gate_strength,
+            )
+        self.covariance_mode = covariance_mode
+        self.covariance_space = covariance_space
+        self.covariance_normalization = covariance_normalization
         assert not register_orthogonalize or n_storage_tokens > 1, (
             "register_orthogonalize requires at least 2 register tokens"
+        )
+        assert not register_orthogonalize or n_storage_tokens <= embed_dim, (
+            "register_orthogonalize requires n_storage_tokens <= embed_dim"
         )
         assert register_orth_eps > 0, "register_orth_eps must be positive"
         self.register_orthogonalize = register_orthogonalize
@@ -207,8 +340,15 @@ class DinoVisionTransformer(nn.Module):
                 "using SLOT register attention "
                 f"(mode={slot_mode}, exclude_cls={register_attn_exclude_cls}, "
                 f"patch_cls_attn_type={patch_cls_attn_type}, slot_start_layer={slot_start_layer}, "
-                f"register_budget_gate={register_budget_gate}) with {n_storage_tokens} registers"
+                f"register_budget_gate={register_budget_gate}, "
+                f"register_to_register_attention={register_to_register_attention}, "
+                f"patch_to_patch_attention={patch_to_patch_attention}) with {n_storage_tokens} registers"
             )
+            if register_init == "predicted_gaussian":
+                logger.info(
+                    "inserting image-conditioned Gaussian registers after block %d",
+                    register_insert_layer - 1,
+                )
         elif patch_cls_attn_type == "separate_register_budget":
             assert n_storage_tokens > 0, "patch_cls_attn_type='separate_register_budget' requires n_storage_tokens > 0"
             logger.info(
@@ -223,6 +363,8 @@ class DinoVisionTransformer(nn.Module):
             exclude_cls=register_attn_exclude_cls,
             patch_cls_attn_type=patch_cls_attn_type,
             register_budget_gate=register_budget_gate,
+            register_to_register_attention=register_to_register_attention,
+            patch_to_patch_attention=patch_to_patch_attention,
         )
         budget_attn_class = partial(
             PatchClsSeparateRegisterBudgetAttention,
@@ -231,6 +373,8 @@ class DinoVisionTransformer(nn.Module):
         )
 
         def attn_class_for_layer(i: int):
+            if register_init == "predicted_gaussian" and i < register_insert_layer:
+                return SelfAttention
             # Layers before `slot_start_layer` skip the slot competition but keep
             # the separate register budget (so the only delta vs. the budget
             # baseline is *where* the competition applies).
@@ -255,6 +399,11 @@ class DinoVisionTransformer(nn.Module):
                 init_values=layerscale_init,
                 attn_class=attn_class_for_layer(i),
                 mask_k_bias=mask_k_bias,
+                covariance_mode=covariance_mode,
+                covariance_space=covariance_space,
+                covariance_normalization=covariance_normalization,
+                covariance_eps=covariance_eps,
+                covariance_gate_strength=covariance_gate_strength,
                 device=device,
             )
             for i in range(depth)
@@ -286,7 +435,7 @@ class DinoVisionTransformer(nn.Module):
     def init_weights(self):
         self.rope_embed._init_weights()
         nn.init.normal_(self.cls_token, std=0.02)
-        if self.n_storage_tokens > 0:
+        if self.n_storage_tokens > 0 and self.register_init != "predicted_gaussian":
             if self.register_init == "gaussian":
                 nn.init.xavier_uniform_(self.storage_tokens)
                 nn.init.xavier_uniform_(self.storage_tokens_log_sigma)
@@ -305,7 +454,7 @@ class DinoVisionTransformer(nn.Module):
             cls_token = self.cls_token
         else:
             cls_token = self.cls_token + 0 * self.mask_token
-        if self.n_storage_tokens > 0:
+        if self.n_storage_tokens > 0 and self.register_init != "predicted_gaussian":
             if self.register_init == "gaussian":
                 mu = self.storage_tokens.expand(B, self.n_storage_tokens, -1)
                 sigma = self.storage_tokens_log_sigma.exp().expand(B, self.n_storage_tokens, -1)
@@ -333,39 +482,46 @@ class DinoVisionTransformer(nn.Module):
 
         return x, (H, W)
 
-    def _orthogonalize_registers(self, x: Tensor) -> Tensor:
-        """Symmetric (Loewdin) orthogonalization of the register tokens.
+    def _insert_predicted_registers(self, x: Tensor) -> Tensor:
+        """Sample per-image registers from parameters predicted at mid-depth."""
+        assert self.register_init == "predicted_gaussian"
+        pooled = x.mean(dim=1)
+        mu, log_sigma = self.register_predictor(pooled).chunk(2, dim=-1)
+        sigma = log_sigma.clamp(min=-10.0, max=5.0).exp()
+        eps = torch.randn(
+            x.shape[0],
+            self.n_storage_tokens,
+            x.shape[-1],
+            dtype=x.dtype,
+            device=x.device,
+        )
+        registers = mu[:, None, :] + eps * sigma[:, None, :]
+        return torch.cat([x[:, :1], registers, x[:, 1:]], dim=1)
 
-        Y = (X X^T + eps I)^{-1/2} X applied per image to the R register rows,
-        making them mutually orthogonal while staying as close as possible to
-        the originals (in Frobenius norm). The projection matrix is computed
-        under no_grad (the whitening matrix is treated as a constant, as in
-        decorrelation/whitening layers), so gradients only flow through the
-        well-conditioned P @ X product and eigh backward's degenerate-spectrum
-        instability is never exercised. The Gram + eigh run in float64: for
-        collapsed registers the residual structure sits ~1e-6 below the Gram
-        diagonal, beyond fp32 — a forward precision issue, independent of
-        gradients. Cost is one tiny [B, R, R] eigh per block.
+    def _registers_present_after_block(self, block_index: int) -> bool:
+        return self.register_init != "predicted_gaussian" or block_index + 1 >= self.register_insert_layer
+
+    def _orthogonalize_registers(self, x: Tensor) -> Tensor:
+        """Regularized symmetric (Löwdin) orthogonalization of registers.
+
+        Y = (X X^T + alpha I)^{-1/2} X applied per image to the R register rows,
+        where alpha is eps times the mean Gram diagonal. With eps=0 and
+        full-row-rank X this is the closest row-orthonormal matrix to X in
+        Frobenius norm. A positive eps makes the operation continuous near rank
+        deficiency and therefore approximately, rather than exactly,
+        orthogonal. The custom backward differentiates the complete regularized
+        map without differentiating eigenvectors, so repeated eigenvalues are
+        safe. The tiny Gram eigendecomposition runs in float64 to retain weak
+        residual directions when registers are nearly collinear.
+
+        Optional per-row norm restoration preserves orthogonality but changes
+        the nearest-point interpretation described above.
         """
         R = self.n_storage_tokens
         reg = x[:, 1 : R + 1]
         orig_dtype = reg.dtype
-        with torch.no_grad():
-            r64 = reg.double()
-            gram = r64 @ r64.transpose(-1, -2)
-            # Relative ridge: register norms vary by orders of magnitude over
-            # training, so the regularizer must scale with the Gram diagonal. It
-            # must also stay below the residual eigenvalue fraction of collapsed
-            # registers, or their residual directions are suppressed
-            # (lambda/(lambda+eps) -> 0) rather than orthogonalized.
-            diag_mean = gram.diagonal(dim1=-2, dim2=-1).mean(-1).clamp_min(1e-24)
-            ridge = self.register_orth_eps * diag_mean
-            gram = gram + ridge[:, None, None] * torch.eye(R, device=gram.device, dtype=gram.dtype)
-            evals, evecs = torch.linalg.eigh(gram)
-            inv_sqrt = (evecs * evals.clamp_min(1e-30).rsqrt()[:, None, :]) @ evecs.transpose(-1, -2)
-            proj = inv_sqrt.to(torch.float32)  # [B, R, R]
         r32 = reg.float()
-        out = proj @ r32
+        out = _regularized_lowdin(r32, self.register_orth_eps)
         if self.register_orth_preserve_norm:
             out = out * (r32.norm(dim=-1, keepdim=True) / out.norm(dim=-1, keepdim=True).clamp_min(1e-12))
         return torch.cat([x[:, :1], out.to(orig_dtype), x[:, R + 1 :]], dim=1)
@@ -377,13 +533,15 @@ class DinoVisionTransformer(nn.Module):
             t2_x, hw_tuple = self.prepare_tokens_with_masks(t_x, t_masks)
             x.append(t2_x)
             rope.append(hw_tuple)
-        for _, blk in enumerate(self.blocks):
+        for i, blk in enumerate(self.blocks):
             if self.rope_embed is not None:
                 rope_sincos = [self.rope_embed(H=H, W=W) for H, W in rope]
             else:
                 rope_sincos = [None for r in rope]
             x = blk(x, rope_sincos)
-            if self.register_orthogonalize:
+            if self.register_init == "predicted_gaussian" and i + 1 == self.register_insert_layer:
+                x = [self._insert_predicted_registers(t) for t in x]
+            if self.register_orthogonalize and self._registers_present_after_block(i):
                 x = [self._orthogonalize_registers(t) for t in x]
         all_x = x
         output = []
@@ -424,13 +582,19 @@ class DinoVisionTransformer(nn.Module):
         # If n is an int, take the n last blocks. If it's a list, take them
         output, total_block_len = [], len(self.blocks)
         blocks_to_take = range(total_block_len - n, total_block_len) if isinstance(n, int) else n
+        if self.register_init == "predicted_gaussian":
+            assert min(blocks_to_take) >= self.register_insert_layer - 1, (
+                "intermediate outputs requested before predicted registers are inserted"
+            )
         for i, blk in enumerate(self.blocks):
             if self.rope_embed is not None:
                 rope_sincos = self.rope_embed(H=H, W=W)
             else:
                 rope_sincos = None
             x = blk(x, rope_sincos)
-            if self.register_orthogonalize:
+            if self.register_init == "predicted_gaussian" and i + 1 == self.register_insert_layer:
+                x = self._insert_predicted_registers(x)
+            if self.register_orthogonalize and self._registers_present_after_block(i):
                 x = self._orthogonalize_registers(x)
             if i in blocks_to_take:
                 output.append(x)
@@ -483,10 +647,14 @@ class DinoVisionTransformer(nn.Module):
         return "standard"
 
     def _normalize_attention_layers(self, layers: Optional[Sequence[int]] = None) -> List[int]:
+        first_register_layer = self.register_insert_layer if self.register_init == "predicted_gaussian" else 0
         if layers is None:
-            return list(range(self.n_blocks))
+            return list(range(first_register_layer, self.n_blocks))
         out = sorted({int(layer) % self.n_blocks for layer in layers})
         assert len(out) > 0, "at least one attention layer must be requested"
+        assert out[0] >= first_register_layer, (
+            f"register attention is unavailable before layer {first_register_layer}"
+        )
         return out
 
     @torch.no_grad()
@@ -532,6 +700,7 @@ class DinoVisionTransformer(nn.Module):
                         slot_renorm=(self.slot_mode == "slot"),
                         slot_exclude_cls=self.register_attn_exclude_cls,
                         patch_cls_attn_type=self.patch_cls_attn_type,
+                        patch_to_patch_attention=self.patch_to_patch_attention,
                         direction=direction,
                     )
                     masks_by_direction[direction].append(masks)
@@ -540,7 +709,9 @@ class DinoVisionTransformer(nn.Module):
                 if i == last_needed:
                     break
             x = blk(x, rope)
-            if self.register_orthogonalize:
+            if self.register_init == "predicted_gaussian" and i + 1 == self.register_insert_layer:
+                x = self._insert_predicted_registers(x)
+            if self.register_orthogonalize and self._registers_present_after_block(i):
                 x = self._orthogonalize_registers(x)
         assert seen_layers == target_layers, f"only collected layers {seen_layers}, expected {target_layers}"
         out: Dict[str, Any] = {"spatial_size": (H, W), "layers": seen_layers}
@@ -564,6 +735,10 @@ class DinoVisionTransformer(nn.Module):
         """
         assert self.n_storage_tokens > 0, "no register tokens to visualize"
         target_layer = int(layer) % self.n_blocks
+        if self.register_init == "predicted_gaussian":
+            assert target_layer >= self.register_insert_layer, (
+                f"register embeddings are unavailable before layer {self.register_insert_layer}"
+            )
         x, (H, W) = self.prepare_tokens_with_masks(x)
         for i, blk in enumerate(self.blocks):
             rope = self.rope_embed(H=H, W=W) if self.rope_embed is not None else None
@@ -581,7 +756,9 @@ class DinoVisionTransformer(nn.Module):
                     cls_similarity.reshape(x.shape[0], H, W),
                 )
             x = blk(x, rope)
-            if self.register_orthogonalize:
+            if self.register_init == "predicted_gaussian" and i + 1 == self.register_insert_layer:
+                x = self._insert_predicted_registers(x)
+            if self.register_orthogonalize and self._registers_present_after_block(i):
                 x = self._orthogonalize_registers(x)
         raise AssertionError(f"layer {target_layer} was not reached")
 
@@ -659,14 +836,17 @@ class DinoVisionTransformer(nn.Module):
         ret = self.forward_features(*args, **kwargs)
         if is_training:
             return ret
-        if getattr(self, "classifier_pooling", "cls") == "global_avg_all":
+        classifier_pooling = getattr(self, "classifier_pooling", "cls")
+        if classifier_pooling == "global_avg_all":
             tokens = [ret["x_norm_clstoken"].unsqueeze(1)]
             if ret["x_storage_tokens"].numel() > 0:
                 tokens.append(ret["x_storage_tokens"])
             tokens.append(ret["x_norm_patchtokens"])
             return self.head(torch.cat(tokens, dim=1).mean(dim=1))
-        else:
-            return self.head(ret["x_norm_clstoken"])
+        if classifier_pooling == "global_avg_registers":
+            assert self.n_storage_tokens > 0, "global_avg_registers requires register tokens"
+            return self.head(ret["x_storage_tokens"].mean(dim=1))
+        return self.head(ret["x_norm_clstoken"])
 
 
 def vit_small(patch_size=16, **kwargs):

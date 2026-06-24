@@ -118,9 +118,24 @@ def _build_model(cfg: DictConfig) -> nn.Module:
         slot_mode=str(mcfg.slot_mode),
         register_attn_exclude_cls=bool(mcfg.register_attn_exclude_cls),
         patch_cls_attn_type=str(mcfg.patch_cls_attn_type),
+        register_to_register_attention=bool(mcfg.get("register_to_register_attention", False)),
+        slot_start_layer=int(mcfg.get("slot_start_layer", 0)),
+        register_budget_gate=bool(mcfg.get("register_budget_gate", False)),
+        patch_to_patch_attention=bool(mcfg.get("patch_to_patch_attention", True)),
         register_init=str(mcfg.register_init),
+        register_insert_layer=mcfg.get("register_insert_layer", None),
+        register_orthogonalize=bool(mcfg.get("register_orthogonalize", False)),
+        register_orth_eps=float(mcfg.get("register_orth_eps", 1e-6)),
+        register_orth_preserve_norm=bool(mcfg.get("register_orth_preserve_norm", True)),
+        covariance_mode=str(mcfg.get("covariance_mode", "none")),
+        covariance_space=str(mcfg.get("covariance_space", "value")),
+        covariance_normalization=str(mcfg.get("covariance_normalization", "relative_second_moment")),
+        covariance_eps=float(mcfg.get("covariance_eps", 1e-6)),
+        covariance_gate_strength=float(mcfg.get("covariance_gate_strength", math.log(2.0))),
     )
     model.classifier_pooling = str(mcfg.get("pooling", "cls"))
+    if model.classifier_pooling not in ("cls", "global_avg_all", "global_avg_registers"):
+        raise ValueError(f"unknown classifier pooling mode: {model.classifier_pooling}")
     model.head = nn.Linear(model.embed_dim, int(mcfg.num_classes))
     model.init_weights()
     nn.init.trunc_normal_(model.head.weight, std=0.02)
@@ -193,10 +208,19 @@ def _maybe_mixup(images: torch.Tensor, targets: torch.Tensor, cfg: DictConfig) -
 
 def _probe_microbatch(model: nn.Module, cfg: DictConfig, device: torch.device) -> tuple[int, int]:
     target = int(cfg.train.batch_size)
-    candidates = [target]
-    if bool(cfg.train.get("auto_microbatch", True)):
-        while candidates[-1] > int(cfg.train.get("min_microbatch", 32)):
-            candidates.append(candidates[-1] // 2)
+    configured_microbatch = cfg.train.get("microbatch_size", None)
+    if configured_microbatch is not None:
+        configured_microbatch = int(configured_microbatch)
+        if configured_microbatch <= 0 or target % configured_microbatch != 0:
+            raise ValueError(
+                f"microbatch_size={configured_microbatch} must be positive and divide batch_size={target}"
+            )
+        candidates = [configured_microbatch]
+    else:
+        candidates = [target]
+        if bool(cfg.train.get("auto_microbatch", True)):
+            while candidates[-1] > int(cfg.train.get("min_microbatch", 32)):
+                candidates.append(candidates[-1] // 2)
 
     for microbatch in candidates:
         if target % microbatch != 0:

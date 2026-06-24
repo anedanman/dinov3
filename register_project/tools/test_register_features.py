@@ -19,7 +19,7 @@ import torch
 
 from dinov3.layers.attention import PatchClsSeparateRegisterBudgetAttention, RegisterSlotAttention, SelfAttention
 from dinov3.loss.register_consistency_loss import register_consistency_loss
-from dinov3.models.vision_transformer import DinoVisionTransformer
+from dinov3.models.vision_transformer import DinoVisionTransformer, _regularized_lowdin
 
 PASSED = []
 
@@ -132,6 +132,71 @@ def test_slot_start_layer():
         and torch.isfinite(maps["register_to_patch"]["masks"]).all(),
     )
 
+    bipartite = _tiny_vit(
+        register_attn_type="slot",
+        patch_cls_attn_type="separate_register_budget",
+        patch_to_patch_attention=False,
+        register_attn_exclude_cls=False,
+    )
+    bipartite_out = bipartite.forward_features(x)
+    bipartite_maps = bipartite.get_register_attention_layers(x, layers=[-1])
+    patch_prefix_mass = (
+        bipartite_maps["patch_to_register"]["masks"].sum(dim=-2)
+        + bipartite_maps["patch_to_register"]["cls"]
+    )
+    check(
+        "no patch-to-patch: forward and attention extraction work",
+        torch.isfinite(bipartite_out["x_prenorm"]).all()
+        and torch.isfinite(bipartite_maps["patch_to_register"]["masks"]).all()
+        and torch.allclose(patch_prefix_mass, torch.ones_like(patch_prefix_mass), atol=1e-6),
+    )
+
+
+def test_predicted_gaussian_register_insertion():
+    torch.manual_seed(0)
+    model = _tiny_vit(
+        register_attn_type="slot",
+        patch_cls_attn_type="separate_register_budget",
+        register_init="predicted_gaussian",
+        register_insert_layer=2,
+        slot_start_layer=2,
+    )
+    images = torch.randn(2, 3, 32, 32)
+    prepared, _ = model.prepare_tokens_with_masks(images)
+    types = [type(block.attn) for block in model.blocks]
+    check(
+        "predicted registers: absent initially and standard attention before insertion",
+        prepared.shape[1] == 1 + 4
+        and types[:2] == [SelfAttention, SelfAttention]
+        and types[2:] == [RegisterSlotAttention, RegisterSlotAttention],
+    )
+
+    first = model.forward_features(images)
+    second = model.forward_features(images)
+    check(
+        "predicted registers: inserted at mid-depth and sampled per forward",
+        first["x_prenorm"].shape == (2, 1 + 3 + 4, 64)
+        and not torch.equal(first["x_storage_tokens"], second["x_storage_tokens"]),
+    )
+
+    maps = model.get_register_attention_layers(images)
+    check(
+        "predicted registers: attention extraction starts after insertion",
+        maps["layers"] == [2, 3]
+        and maps["register_to_patch"]["masks"].shape[:4] == (2, 2, 4, 3),
+    )
+
+    model.zero_grad(set_to_none=True)
+    model.classifier_pooling = "global_avg_registers"
+    loss = (model(images) * torch.randn(2, 64)).sum()
+    loss.backward()
+    predictor_grads = [parameter.grad for parameter in model.register_predictor.parameters()]
+    check(
+        "predicted registers: predictor receives finite nonzero gradients",
+        all(grad is not None and torch.isfinite(grad).all() for grad in predictor_grads)
+        and sum(grad.abs().sum().item() for grad in predictor_grads) > 0.0,
+    )
+
 
 def test_register_budget_gate():
     torch.manual_seed(0)
@@ -210,13 +275,15 @@ def test_register_orthogonalization():
     )
 
     # Nearly collapsed registers (shared direction + tiny residuals): stays
-    # finite, differentiable, and much more orthogonal than the input.
+    # finite, differentiable, and much more orthogonal than the input. A random
+    # directional loss exercises the whitening derivative; a squared-norm loss
+    # mostly exercises the optional norm-restoration path instead.
     shared = torch.randn(B, 1, D) * 5.0
     x2 = torch.randn(B, 1 + R + P, D)
     x2[:, 1 : R + 1] = shared + 0.01 * torch.randn(B, R, D)
     x2.requires_grad_(True)
     y2 = model._orthogonalize_registers(x2)
-    y2[:, 1 : R + 1].pow(2).sum().backward()
+    (y2[:, 1 : R + 1] * torch.randn_like(y2[:, 1 : R + 1])).sum().backward()
     cos_in = off_diag_cos(x2[:, 1 : R + 1].detach())
     cos_out = off_diag_cos(y2[:, 1 : R + 1].detach())
     check(
@@ -224,11 +291,77 @@ def test_register_orthogonalization():
         torch.isfinite(y2).all() and torch.isfinite(x2.grad).all() and cos_out < 0.5 * cos_in,
     )
 
+    # The custom VJP must agree with finite differences. This also covers an
+    # exactly repeated Gram spectrum, where generic eigh/SVD backward produces
+    # undefined eigenvector/singular-vector gradients despite the polar map
+    # itself having a well-defined derivative.
+    gradcheck_random = torch.randn(1, 3, 7, dtype=torch.float64, requires_grad=True)
+    gradcheck_repeated = torch.eye(3, 7, dtype=torch.float64).unsqueeze(0).requires_grad_()
+    check(
+        "orth: custom backward passes gradcheck",
+        torch.autograd.gradcheck(
+            lambda z: _regularized_lowdin(z, 1e-4),
+            (gradcheck_random,),
+            eps=1e-6,
+            atol=2e-5,
+            rtol=2e-4,
+        )
+        and torch.autograd.gradcheck(
+            lambda z: _regularized_lowdin(z, 1e-4),
+            (gradcheck_repeated,),
+            eps=1e-6,
+            atol=2e-5,
+            rtol=2e-4,
+        ),
+    )
+
+    x_bf16 = torch.randn(2, 1 + R + P, D, dtype=torch.bfloat16, requires_grad=True)
+    y_bf16 = model._orthogonalize_registers(x_bf16)
+    y_bf16.float().mul(torch.randn_like(y_bf16.float())).sum().backward()
+    check(
+        "orth: bf16 boundary preserves dtype and finite gradients",
+        y_bf16.dtype == torch.bfloat16 and x_bf16.grad is not None and torch.isfinite(x_bf16.grad).all(),
+    )
+
+    try:
+        DinoVisionTransformer(
+            img_size=16,
+            patch_size=16,
+            embed_dim=4,
+            depth=1,
+            num_heads=1,
+            n_storage_tokens=5,
+            register_orthogonalize=True,
+        )
+        feasible_shape_rejected = False
+    except AssertionError as error:
+        feasible_shape_rejected = "n_storage_tokens <= embed_dim" in str(error)
+    check("orth: rejects more registers than embedding dimensions", feasible_shape_rejected)
+
     # Full forward path applies it: prenorm registers of the last block output
     # are mutually orthogonal.
     out = model.forward_features(torch.randn(2, 3, 32, 32))
     prenorm_reg = out["x_prenorm"][:, 1 : R + 1]
     check("orth: forward_features output registers orthogonal", off_diag_cos(prenorm_reg) < 1e-2)
+    model.zero_grad(set_to_none=True)
+    (out["x_storage_tokens"] * torch.randn_like(out["x_storage_tokens"])).sum().backward()
+    parameter_grads = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
+    check(
+        "orth: full model backward gradients finite",
+        len(parameter_grads) > 0 and all(torch.isfinite(grad).all() for grad in parameter_grads),
+    )
+
+
+def test_classifier_pooling():
+    model = _tiny_vit(register_init="learned")
+    model.classifier_pooling = "global_avg_registers"
+    images = torch.randn(2, 3, 32, 32)
+    features = model.forward_features(images)
+    pooled = model(images)
+    check(
+        "classifier pooling: register-only mean excludes CLS and patches",
+        torch.allclose(pooled, features["x_storage_tokens"].mean(dim=1), atol=1e-6),
+    )
 
 
 def test_diagnostics():
@@ -326,8 +459,10 @@ def test_viz_panels():
 def main():
     test_consistency_loss()
     test_slot_start_layer()
+    test_predicted_gaussian_register_insertion()
     test_register_budget_gate()
     test_register_orthogonalization()
+    test_classifier_pooling()
     test_diagnostics()
     test_viz_panels()
     if not all(PASSED):

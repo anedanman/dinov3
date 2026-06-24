@@ -39,6 +39,18 @@ def _reference_full_attention(q, k, v, scale):
     return torch.matmul(attn.to(v.dtype), v)
 
 
+def _reference_no_patch_to_patch_rows(q, k, v, R, scale):
+    """Explicit reference for CLS->all and patch->{CLS, registers}."""
+    q_cls = q[:, :, :1, :].float()
+    q_patch = q[:, :, 1 + R :, :].float()
+    k_all = k.float()
+    out_cls = torch.softmax(q_cls @ k_all.transpose(-2, -1) * scale, dim=-1) @ v.float()
+    k_prefix = k[:, :, : 1 + R, :].float()
+    v_prefix = v[:, :, : 1 + R, :].float()
+    out_patch = torch.softmax(q_patch @ k_prefix.transpose(-2, -1) * scale, dim=-1) @ v_prefix
+    return torch.cat([out_cls, out_patch], dim=-2).to(v.dtype)
+
+
 def _qkv_to_heads(qkv, num_heads):
     B, N, C3 = qkv.shape
     C = C3 // 3
@@ -64,29 +76,75 @@ def main():
     ok = True
     for slot_mode in ("slot", "literal"):
         for patch_cls_attn_type in ("standard", "separate_register_budget"):
-            attn = RegisterSlotAttention(
-                dim,
-                num_heads=heads,
-                qkv_bias=True,
-                n_storage_tokens=R,
-                slot_mode=slot_mode,
-                exclude_cls=True,
-                patch_cls_attn_type=patch_cls_attn_type,
-            ).to(device=device, dtype=dtype)
-            x = torch.randn(B, N, dim, device=device, dtype=dtype)
-            qkv = attn.qkv(x)
-            out = attn.compute_attention(qkv)
+            for register_to_register_attention in (False, True):
+                attn = RegisterSlotAttention(
+                    dim,
+                    num_heads=heads,
+                    qkv_bias=True,
+                    n_storage_tokens=R,
+                    slot_mode=slot_mode,
+                    exclude_cls=True,
+                    patch_cls_attn_type=patch_cls_attn_type,
+                    register_to_register_attention=register_to_register_attention,
+                ).to(device=device, dtype=dtype)
+                x = torch.randn(B, N, dim, device=device, dtype=dtype)
+                qkv = attn.qkv(x)
+                out = attn.compute_attention(qkv)
 
-            q, k, v = _qkv_to_heads(qkv, heads)
-            if patch_cls_attn_type == "separate_register_budget":
-                rows = _reference_separate_budget_rows(q, k, v, R, scale)
-            else:
-                q_nonreg = torch.cat([q[:, :, :1, :], q[:, :, 1 + R :, :]], dim=-2)
-                rows = _reference_full_attention(q_nonreg, k, v, scale)
-            reg = compute_register_competition(q, k, v, R, scale, renorm=slot_mode == "slot", exclude_cls=True)
-            ref = torch.cat([rows[:, :, :1, :], reg, rows[:, :, 1:, :]], dim=-2)
-            ref = ref.transpose(1, 2).reshape(B, N, dim)
-            ok &= _check(f"RegisterSlotAttention(slot_mode={slot_mode}, patch_cls={patch_cls_attn_type})", out, ref, tol)
+                q, k, v = _qkv_to_heads(qkv, heads)
+                if patch_cls_attn_type == "separate_register_budget":
+                    rows = _reference_separate_budget_rows(q, k, v, R, scale)
+                else:
+                    q_nonreg = torch.cat([q[:, :, :1, :], q[:, :, 1 + R :, :]], dim=-2)
+                    rows = _reference_full_attention(q_nonreg, k, v, scale)
+                reg = compute_register_competition(
+                    q, k, v, R, scale, renorm=slot_mode == "slot", exclude_cls=True
+                )
+                if register_to_register_attention:
+                    reg = reg + _reference_full_attention(
+                        q[:, :, 1 : 1 + R, :],
+                        k[:, :, 1 : 1 + R, :],
+                        v[:, :, 1 : 1 + R, :],
+                        scale,
+                    )
+                ref = torch.cat([rows[:, :, :1, :], reg, rows[:, :, 1:, :]], dim=-2)
+                ref = ref.transpose(1, 2).reshape(B, N, dim)
+                name = (
+                    f"RegisterSlotAttention(slot_mode={slot_mode}, patch_cls={patch_cls_attn_type}, "
+                    f"reg2reg={register_to_register_attention})"
+                )
+                ok &= _check(name, out, ref, tol)
+
+    for patch_cls_attn_type in ("standard", "separate_register_budget"):
+        attn = RegisterSlotAttention(
+            dim,
+            num_heads=heads,
+            qkv_bias=True,
+            n_storage_tokens=R,
+            slot_mode="slot",
+            exclude_cls=False,
+            patch_cls_attn_type=patch_cls_attn_type,
+            patch_to_patch_attention=False,
+        ).to(device=device, dtype=dtype)
+        qkv = torch.randn(B, N, 3 * dim, device=device, dtype=dtype, requires_grad=True)
+        out = attn.compute_attention(qkv)
+        q, k, v = _qkv_to_heads(qkv, heads)
+        rows = _reference_no_patch_to_patch_rows(q, k, v, R, scale)
+        reg = compute_register_competition(q, k, v, R, scale, renorm=True, exclude_cls=False)
+        ref = torch.cat([rows[:, :, :1, :], reg, rows[:, :, 1:, :]], dim=-2)
+        ref = ref.transpose(1, 2).reshape(B, N, dim)
+        name = f"RegisterSlotAttention(no_patch2patch, patch_cls={patch_cls_attn_type})"
+        ok &= _check(name, out, ref, tol)
+        weight = torch.randn_like(out)
+        grad_actual = torch.autograd.grad((out * weight).sum(), qkv, retain_graph=True)[0]
+        grad_reference = torch.autograd.grad((ref * weight).sum(), qkv)[0]
+        ok &= _check(f"{name} gradient", grad_actual, grad_reference, 3e-4)
+        patch_only_grad = torch.autograd.grad(out[:, 1 + R :].float().sum(), qkv)[0]
+        patch_only_grad = patch_only_grad.reshape(B, N, 3, heads, dim // heads)
+        forbidden_kv_grad = patch_only_grad[:, 1 + R :, 1:, :, :].abs().max().item()
+        status = "OK " if forbidden_kv_grad == 0.0 else "FAIL"
+        print(f"[{status}] {name} has no patch-key/value dependency: max grad = {forbidden_kv_grad:.3e}")
+        ok &= forbidden_kv_grad == 0.0
 
     attn = PatchClsSeparateRegisterBudgetAttention(
         dim, num_heads=heads, qkv_bias=True, n_storage_tokens=R
@@ -100,6 +158,30 @@ def main():
     ref = torch.cat([rows[:, :, :1, :], reg, rows[:, :, 1:, :]], dim=-2)
     ref = ref.transpose(1, 2).reshape(B, N, dim)
     ok &= _check("PatchClsSeparateRegisterBudgetAttention", out, ref, tol)
+
+    if device == "cuda":
+        attn = RegisterSlotAttention(
+            dim,
+            num_heads=heads,
+            qkv_bias=True,
+            n_storage_tokens=R,
+            slot_mode="slot",
+            exclude_cls=False,
+            patch_cls_attn_type="standard",
+            patch_to_patch_attention=False,
+        ).to(device=device, dtype=torch.bfloat16)
+        qkv = torch.randn(B, N, 3 * dim, device=device, dtype=torch.bfloat16, requires_grad=True)
+        out = attn.compute_attention(qkv)
+        q, k, v = _qkv_to_heads(qkv, heads)
+        rows = _reference_no_patch_to_patch_rows(q, k, v, R, scale)
+        reg = compute_register_competition(q, k, v, R, scale, renorm=True, exclude_cls=False)
+        ref = torch.cat([rows[:, :, :1, :], reg, rows[:, :, 1:, :]], dim=-2)
+        ref = ref.transpose(1, 2).reshape(B, N, dim)
+        ok &= _check("RegisterSlotAttention(no_patch2patch, bf16)", out, ref, 3e-2)
+        weight = torch.randn_like(out)
+        grad_actual = torch.autograd.grad((out * weight).sum(), qkv, retain_graph=True)[0]
+        grad_reference = torch.autograd.grad((ref * weight).sum(), qkv)[0]
+        ok &= _check("RegisterSlotAttention(no_patch2patch, bf16) gradient", grad_actual, grad_reference, 8e-2)
 
     if not ok:
         raise SystemExit(1)

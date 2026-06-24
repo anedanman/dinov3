@@ -193,16 +193,30 @@ Outputs (checkpoints, logs, `config.yaml`) land in `runs/<name>/`.
 
 **Symmetric register orthogonalization** — `student.register_orthogonalize`
 - After every block, the R register tokens are re-projected per image with
-  Loewdin symmetric orthogonalization `Y = (XX^T + eps I)^{-1/2} X`
-  (`register_orth_eps`, default 1e-6, relative to the mean Gram diagonal) —
-  the closest set of mutually orthogonal vectors to the originals. The
-  projection matrix is computed with a float64 eigh under no_grad (whitening
-  matrix treated as a constant), so gradients only flow through the `P @ X`
-  product and eigh's degenerate-spectrum backward instability never applies.
+  regularized Löwdin symmetric orthogonalization
+  `Y = (XX^T + alpha I)^{-1/2} X`, where
+  `alpha = register_orth_eps * mean(diag(XX^T))` (default eps 1e-6). Without
+  the ridge this is the closest row-orthonormal matrix to the originals; the
+  ridge trades exact orthogonality for continuity near rank deficiency. The
+  Gram eigendecomposition runs in float64, and a custom Fréchet derivative
+  differentiates the complete regularized map without unstable eigenvector-gap
+  terms, including when Gram eigenvalues repeat.
   `register_orth_preserve_norm` (default true) rescales each
   register back to its pre-projection norm so only directions are constrained.
   Directly prevents the register collapse onto a shared direction observed in
-  slot2/slot3. Enable with `student.register_orthogonalize=true`.
+  slot2/slot3. Enable with `student.register_orthogonalize=true` for SSL or
+  `model.register_orthogonalize=true` for the classification trainer.
+
+**Disable patch-to-patch attention** — `patch_to_patch_attention=false`
+- Requires slot attention from layer 0. CLS queries still attend to every key;
+  patch queries attend only to CLS/register keys; register queries attend only
+  to CLS/patch keys (set `register_attn_exclude_cls=false` for the CLS edge).
+- The implementation decomposes the graph into small SDPA calls instead of
+  applying a dense mask, so it never computes or stores `P x P` patch scores.
+  Patch rows use one normalized softmax over the combined CLS/register key set;
+  CLS is not added as an unconditional residual. The skinny `P x (1+R)` branch
+  explicitly selects PyTorch's fused memory-efficient CUDA SDPA backend, which
+  benchmarks faster than FlashAttention and custom Triton kernels for this shape.
 
 **Learnable register-budget gate** — `student.register_budget_gate`
 - Per-head, per-layer multiplier on the separate register budget:
